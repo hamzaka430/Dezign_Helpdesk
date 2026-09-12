@@ -5,6 +5,7 @@
 
 -- ---- Add Stripe customer ID to tenants ---------------------
 ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT;
+ALTER TABLE tenants ADD COLUMN slug TEXT;
 
 -- ---- Add widget and notification settings ------------------
 ALTER TABLE workspace_settings ADD COLUMN widget_primary_color TEXT DEFAULT '#6a4cf5';
@@ -17,11 +18,20 @@ ALTER TABLE workspace_settings ADD COLUMN slack_webhook_url TEXT;
 ALTER TABLE workspace_settings ADD COLUMN ai_model TEXT DEFAULT 'gpt-4o-mini';
 ALTER TABLE workspace_settings ADD COLUMN max_tokens INTEGER DEFAULT 600;
 
+-- ---- SSO settings (Phase 6) --------------------------------
+ALTER TABLE workspace_settings ADD COLUMN sso_enabled INTEGER DEFAULT 0;
+ALTER TABLE workspace_settings ADD COLUMN sso_provider TEXT;
+ALTER TABLE workspace_settings ADD COLUMN sso_metadata_url TEXT;
+ALTER TABLE workspace_settings ADD COLUMN sso_entity_id TEXT;
+ALTER TABLE workspace_settings ADD COLUMN sso_acs_url TEXT;
+ALTER TABLE workspace_settings ADD COLUMN sso_enforce INTEGER DEFAULT 0;
+
 -- ---- Add kb_id to api_keys for widget scoping ---------------
 ALTER TABLE api_keys ADD COLUMN kb_id TEXT REFERENCES knowledge_bases(id);
 
--- ---- Add channel field to tickets ---------------------------
-ALTER TABLE tickets ADD COLUMN channel TEXT DEFAULT 'manual' CHECK (channel IN ('manual','widget','email','api'));
+-- ---- Add channel and SLA fields to tickets ------------------
+ALTER TABLE tickets ADD COLUMN channel TEXT DEFAULT 'manual';
+ALTER TABLE tickets ADD COLUMN sla_due_at TEXT;
 
 -- ---- CSAT / Feedback table (Phase 5) -----------------------
 CREATE TABLE IF NOT EXISTS csat_ratings (
@@ -41,10 +51,10 @@ CREATE TABLE IF NOT EXISTS notifications (
   id          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   user_id     TEXT REFERENCES users(id),
-  type        TEXT NOT NULL CHECK (type IN ('email','slack','webhook','in_app')),
+  type        TEXT NOT NULL,
   subject     TEXT,
   content     TEXT,
-  status      TEXT DEFAULT 'pending' CHECK (status IN ('pending','sent','failed')),
+  status      TEXT DEFAULT 'pending',
   sent_at     TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -58,7 +68,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
   name        TEXT NOT NULL,
   url         TEXT NOT NULL,
   secret      TEXT,
-  events      TEXT NOT NULL DEFAULT '["ticket.created","ticket.updated","conversation.escalated"]',
+  events      TEXT NOT NULL DEFAULT '*',
   is_active   INTEGER NOT NULL DEFAULT 1,
   last_fired  TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -66,20 +76,7 @@ CREATE TABLE IF NOT EXISTS webhooks (
 
 CREATE INDEX IF NOT EXISTS idx_webhooks_tenant ON webhooks(tenant_id);
 
--- ---- SLA due date on tickets --------------------------------
-ALTER TABLE tickets ADD COLUMN sla_due_at TEXT;
-
--- ---- SSO settings (Phase 6) --------------------------------
-ALTER TABLE workspace_settings ADD COLUMN sso_enabled INTEGER DEFAULT 0;
-ALTER TABLE workspace_settings ADD COLUMN sso_provider TEXT;
-ALTER TABLE workspace_settings ADD COLUMN sso_metadata_url TEXT;
-ALTER TABLE workspace_settings ADD COLUMN sso_entity_id TEXT;
-ALTER TABLE workspace_settings ADD COLUMN sso_acs_url TEXT;
-ALTER TABLE workspace_settings ADD COLUMN sso_enforce INTEGER DEFAULT 0;
-
--- ---- Tenant slug for subdomain routing (Phase 6) ------------
-ALTER TABLE tenants ADD COLUMN slug TEXT;
+-- ---- Tenant slug unique index (Phase 6) --------------------
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_slug ON tenants(slug) WHERE slug IS NOT NULL;
 
--- ---- API key timezone on workspace settings -----------------
-ALTER TABLE workspace_settings ADD COLUMN timezone TEXT DEFAULT 'UTC+0';
+-- NOTE: timezone column already exists in 0001_initial_schema.sql — not re-added here.
