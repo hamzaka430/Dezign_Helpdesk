@@ -3,5 +3,31 @@
   "name": "supportiq",
   "compatibility_date": "2024-01-01",
   "pages_build_output_dir": "./dist",
-  "compatibility_flags": ["nodejs_compat"]
+  "compatibility_flags": ["nodejs_compat"],
+
+  // ---- D1 Database ----------------------------------------
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "supportiq-db",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // ---- R2 Object Storage ----------------------------------
+  "r2_buckets": [
+    {
+      "binding": "STORAGE",
+      "bucket_name": "supportiq-docs",
+      "preview_bucket_name": "supportiq-docs-preview"
+    }
+  ],
+
+  // ---- Environment Variables (non-secret) -----------------
+  "vars": {
+    "ENVIRONMENT": "production"
+  }
+  // ---- Secrets (set via wrangler CLI) ---------------------
+  // JWT_SECRET: wrangler pages secret put JWT_SECRET
 }

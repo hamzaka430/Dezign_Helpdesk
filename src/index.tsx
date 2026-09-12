@@ -1,55 +1,56 @@
 import { Hono } from 'hono'
 import { serveStatic } from 'hono/cloudflare-workers'
+import { cors } from 'hono/cors'
+import authRoutes from './routes/auth'
+import ticketRoutes from './routes/tickets'
+import knowledgeRoutes from './routes/knowledge'
+import conversationRoutes from './routes/conversations'
+import settingsRoutes from './routes/settings'
+import statsRoutes from './routes/stats'
+import type { Env } from './lib/middleware'
 
-const app = new Hono()
+const app = new Hono<{ Bindings: Env }>()
 
-// Serve static assets
+// ---- CORS --------------------------------------------------
+app.use('/api/*', cors({
+  origin: '*',
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization'],
+}))
+
+// ---- Static & Favicon --------------------------------------
 app.use('/static/*', serveStatic({ root: './public' }))
 
-// Favicon
-app.get('/favicon.ico', (c) => {
-  return new Response(null, { status: 204 })
-})
+app.get('/favicon.ico', (c) => new Response(null, { status: 204 }))
 app.get('/favicon.svg', (c) => {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#6a4cf5"/><stop offset="100%" stop-color="#d44df0"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="url(#g)"/><path d="M16 8 L20 14 L14 14 L18 20 L10 14 L16 14 Z" fill="white"/></svg>`
   return new Response(svg, { headers: { 'Content-Type': 'image/svg+xml' } })
 })
 
-// API Routes - Mock data for MVP
-app.get('/api/health', (c) => c.json({ status: 'ok', service: 'SupportIQ' }))
-
-app.get('/api/stats', (c) => c.json({
-  tickets: { total: 1284, open: 47, resolved: 1237 },
-  aiResolutionRate: 78.4,
-  avgResponseTime: '2m 34s',
-  csatScore: 4.7,
-  ticketVolume: [42, 58, 35, 71, 63, 48, 55, 67, 72, 61, 54, 49],
+// ---- Health ------------------------------------------------
+app.get('/api/health', (c) => c.json({
+  status: 'ok', service: 'SupportIQ',
+  version: '1.1.0',
+  db: c.env.DB ? 'connected' : 'not_configured',
+  storage: c.env.STORAGE ? 'connected' : 'not_configured',
+  timestamp: new Date().toISOString()
 }))
 
-app.get('/api/tickets', (c) => c.json({
-  tickets: [
-    { id: 'TKT-1042', subject: 'Unable to reset password', status: 'open', priority: 'high', customer: 'Sarah K.', created: '2h ago', assignee: 'Alex M.' },
-    { id: 'TKT-1041', subject: 'Billing charge discrepancy', status: 'in_progress', priority: 'urgent', customer: 'James R.', created: '3h ago', assignee: 'Maria L.' },
-    { id: 'TKT-1040', subject: 'API integration help needed', status: 'open', priority: 'medium', customer: 'Dev Corp', created: '5h ago', assignee: null },
-    { id: 'TKT-1039', subject: 'Feature request: dark mode', status: 'resolved', priority: 'low', customer: 'Emily T.', created: '1d ago', assignee: 'Alex M.' },
-    { id: 'TKT-1038', subject: 'Export data to CSV', status: 'in_progress', priority: 'medium', customer: 'TechStart Inc', created: '1d ago', assignee: 'Jordan B.' },
-  ]
-}))
+// ---- API Routes (Real — Phase 1) ---------------------------
+app.route('/api/auth', authRoutes)
+app.route('/api/tickets', ticketRoutes)
+app.route('/api/knowledge-bases', knowledgeRoutes)
+app.route('/api/conversations', conversationRoutes)
+app.route('/api/settings', settingsRoutes)
+app.route('/api/stats', statsRoutes)
 
-app.get('/api/knowledge-bases', (c) => c.json({
-  kbs: [
-    { id: 1, name: 'Product Documentation', documents: 24, status: 'indexed', lastUpdated: '2h ago' },
-    { id: 2, name: 'FAQ & Help Center', documents: 12, status: 'indexed', lastUpdated: '1d ago' },
-    { id: 3, name: 'API Reference', documents: 8, status: 'indexing', lastUpdated: 'just now' },
-  ]
-}))
-
+// ---- Legacy /api/chat (Phase 2 will replace with real RAG) -
 app.post('/api/chat', async (c) => {
   const body = await c.req.json()
-  const { message } = body
+  const { message, conversation_id } = body
 
-  // Mock AI response
-  await new Promise(r => setTimeout(r, 500))
+  // Phase 2: replace with real OpenAI + Qdrant RAG
+  await new Promise(r => setTimeout(r, 400))
 
   const responses = [
     { content: "I found this in our documentation: The password reset process takes 5-10 minutes. Check your spam folder if you don't receive the email. You can also try the 'Magic Link' login option.", confidence: 0.92, sources: ['Password Reset Guide', 'Account Settings FAQ'] },
@@ -60,10 +61,32 @@ app.post('/api/chat', async (c) => {
   const response = message.toLowerCase().includes('billing') ? responses[1] :
     message.toLowerCase().includes('password') ? responses[0] : responses[2]
 
+  // If conversation_id given and DB available, persist the messages
+  if (conversation_id && c.env.DB) {
+    try {
+      const { DB: db_lib } = await import('./lib/db')
+      const { generateId } = await import('./lib/auth')
+      const db = new db_lib(c.env.DB)
+      await db.createMessage({
+        id: generateId('msg'), conversation_id,
+        tenant_id: 'tenant_demo_001',
+        sender_type: 'customer', content: message
+      })
+      await db.createMessage({
+        id: generateId('msg'), conversation_id,
+        tenant_id: 'tenant_demo_001',
+        sender_type: 'ai', content: response.content,
+        confidence: response.confidence,
+        sources: (response as any).sources || [],
+        escalate: (response as any).escalate || false
+      })
+    } catch (e) { /* non-fatal */ }
+  }
+
   return c.json(response)
 })
 
-// All page routes - serve the SPA
+// ---- Page Routes -------------------------------------------
 const pages = ['/', '/pricing', '/login', '/signup', '/dashboard', '/dashboard/inbox', '/dashboard/tickets', '/dashboard/knowledge-base', '/dashboard/analytics', '/dashboard/settings', '/widget']
 
 // Landing page HTML generator
@@ -811,36 +834,62 @@ function getLoginHTML(): string {
         <div style="flex: 1; height: 1px; background: #1a1a1a;"></div>
       </div>
       
-      <form onsubmit="handleLogin(event)" style="display: flex; flex-direction: column; gap: 16px;">
+      <div id="error-msg" style="display:none; background: rgba(255,85,119,0.1); border: 1px solid rgba(255,85,119,0.3); border-radius: 10px; padding: 12px 16px; font-size: 13px; color: #ff5577; margin-bottom: 16px;"></div>
+
+      <form id="login-form" onsubmit="handleLogin(event)" style="display: flex; flex-direction: column; gap: 16px;">
         <div>
           <label>Email address</label>
-          <input type="email" class="input-field" placeholder="you@company.com" value="demo@supportiq.io" required>
+          <input id="login-email" type="email" class="input-field" placeholder="you@company.com" required>
         </div>
         <div>
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
             <label style="margin: 0;">Password</label>
             <a href="#" style="font-size: 12px;">Forgot password?</a>
           </div>
-          <input type="password" class="input-field" placeholder="••••••••" value="demo1234" required>
+          <input id="login-password" type="password" class="input-field" placeholder="••••••••" required>
         </div>
-        <button type="submit" class="btn-primary">Sign In</button>
+        <button type="submit" id="login-btn" class="btn-primary">Sign In</button>
       </form>
       
       <p style="text-align: center; font-size: 13px; color: #666; margin-top: 20px;">
         Don't have an account? <a href="/signup">Sign up free</a>
       </p>
     </div>
-    
-    <p style="text-align: center; font-size: 12px; color: #444; margin-top: 20px;">Demo: use any credentials</p>
   </div>
   
   <script>
-    function handleLogin(e) {
-      if (e) e.preventDefault();
-      const btn = document.querySelector('.btn-primary');
+    // Redirect if already logged in
+    if (localStorage.getItem('siq_token')) window.location.href = '/dashboard';
+
+    async function handleLogin(e) {
+      e.preventDefault();
+      const btn = document.getElementById('login-btn');
+      const errEl = document.getElementById('error-msg');
+      const email = document.getElementById('login-email').value.trim();
+      const password = document.getElementById('login-password').value;
+
       btn.textContent = 'Signing in...';
       btn.disabled = true;
-      setTimeout(() => { window.location.href = '/dashboard'; }, 800);
+      errEl.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Login failed');
+        localStorage.setItem('siq_token', data.token);
+        localStorage.setItem('siq_user', JSON.stringify(data.user));
+        localStorage.setItem('siq_tenant', JSON.stringify(data.tenant));
+        window.location.href = '/dashboard';
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.style.display = 'block';
+        btn.textContent = 'Sign In';
+        btn.disabled = false;
+      }
     }
   </script>
 </body>
@@ -876,30 +925,32 @@ function getSignupHTML(): string {
       <h1 style="font-size: 24px; font-weight: 600; letter-spacing: -0.8px; margin-bottom: 8px;">Create your workspace</h1>
       <p style="font-size: 14px; color: #666; margin-bottom: 28px;">Get your AI support agent live in minutes</p>
       
-      <form onsubmit="handleSignup(event)" style="display: flex; flex-direction: column; gap: 16px;">
+      <div id="signup-error" style="display:none; background: rgba(255,85,119,0.1); border: 1px solid rgba(255,85,119,0.3); border-radius: 10px; padding: 12px 16px; font-size: 13px; color: #ff5577; margin-bottom: 16px;"></div>
+
+      <form id="signup-form" onsubmit="handleSignup(event)" style="display: flex; flex-direction: column; gap: 16px;">
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
           <div>
             <label>First name</label>
-            <input type="text" class="input-field" placeholder="Alex" required>
+            <input id="su-first" type="text" class="input-field" placeholder="Alex" required>
           </div>
           <div>
             <label>Last name</label>
-            <input type="text" class="input-field" placeholder="Morgan" required>
+            <input id="su-last" type="text" class="input-field" placeholder="Morgan" required>
           </div>
         </div>
         <div>
           <label>Work email</label>
-          <input type="email" class="input-field" placeholder="you@company.com" required>
+          <input id="su-email" type="email" class="input-field" placeholder="you@company.com" required>
         </div>
         <div>
           <label>Company name</label>
-          <input type="text" class="input-field" placeholder="Acme Corp" required>
+          <input id="su-company" type="text" class="input-field" placeholder="Acme Corp" required>
         </div>
         <div>
           <label>Password</label>
-          <input type="password" class="input-field" placeholder="Min. 8 characters" required>
+          <input id="su-password" type="password" class="input-field" placeholder="Min. 8 characters" required minlength="8">
         </div>
-        <button type="submit" class="btn-primary" style="margin-top: 4px;">
+        <button type="submit" id="signup-btn" class="btn-primary" style="margin-top: 4px;">
           Create Free Account <i class="fas fa-arrow-right" style="margin-left: 8px;"></i>
         </button>
       </form>
@@ -915,12 +966,42 @@ function getSignupHTML(): string {
   </div>
   
   <script>
-    function handleSignup(e) {
+    if (localStorage.getItem('siq_token')) window.location.href = '/dashboard';
+
+    async function handleSignup(e) {
       e.preventDefault();
-      const btn = document.querySelector('.btn-primary');
+      const btn = document.getElementById('signup-btn');
+      const errEl = document.getElementById('signup-error');
       btn.textContent = 'Creating workspace...';
       btn.disabled = true;
-      setTimeout(() => { window.location.href = '/dashboard'; }, 1000);
+      errEl.style.display = 'none';
+
+      const payload = {
+        first_name: document.getElementById('su-first').value.trim(),
+        last_name: document.getElementById('su-last').value.trim(),
+        email: document.getElementById('su-email').value.trim(),
+        company_name: document.getElementById('su-company').value.trim(),
+        password: document.getElementById('su-password').value,
+      };
+
+      try {
+        const res = await fetch('/api/auth/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Signup failed');
+        localStorage.setItem('siq_token', data.token);
+        localStorage.setItem('siq_user', JSON.stringify(data.user));
+        localStorage.setItem('siq_tenant', JSON.stringify(data.tenant));
+        window.location.href = '/dashboard';
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.style.display = 'block';
+        btn.innerHTML = 'Create Free Account <i class="fas fa-arrow-right" style="margin-left: 8px;"></i>';
+        btn.disabled = false;
+      }
     }
   </script>
 </body>
@@ -1037,8 +1118,8 @@ function getDashboardHTML(section: string): string {
   <!-- Workspace selector -->
   <div style="padding: 12px 16px; border-bottom: 1px solid #1a1a1a;">
     <div style="display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #141414; border: 1px solid #1a1a1a; border-radius: 8px; cursor: pointer;">
-      <div style="width: 20px; height: 20px; background: linear-gradient(135deg, #0099ff, #6a4cf5); border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700;">AC</div>
-      <span style="font-size: 12px; font-weight: 500; flex: 1;">Acme Corp</span>
+      <div style="width: 20px; height: 20px; background: linear-gradient(135deg, #0099ff, #6a4cf5); border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700;" id="ws-initials">--</div>
+      <span style="font-size: 12px; font-weight: 500; flex: 1;" id="ws-name">Workspace</span>
       <i class="fas fa-chevron-down" style="font-size: 10px; color: #666;"></i>
     </div>
   </div>
@@ -1076,12 +1157,12 @@ function getDashboardHTML(section: string): string {
   <!-- User -->
   <div style="padding: 16px; border-top: 1px solid #1a1a1a;">
     <div style="display: flex; align-items: center; gap: 10px;">
-      <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0;">AM</div>
+      <div id="user-avatar" style="width: 32px; height: 32px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0;">--</div>
       <div style="min-width: 0;">
-        <div style="font-size: 13px; font-weight: 500; truncate;">Alex Morgan</div>
-        <div style="font-size: 11px; color: #666;">Admin</div>
+        <div id="user-name" style="font-size: 13px; font-weight: 500; truncate;">Loading...</div>
+        <div id="user-role" style="font-size: 11px; color: #666;">--</div>
       </div>
-      <a href="/" style="margin-left: auto; color: #555; font-size: 13px; text-decoration: none;" title="Sign out"><i class="fas fa-sign-out-alt"></i></a>
+      <button onclick="handleLogout()" style="margin-left: auto; background: none; border: none; color: #555; font-size: 13px; cursor: pointer;" title="Sign out"><i class="fas fa-sign-out-alt"></i></button>
     </div>
   </div>
 </nav>
@@ -1113,6 +1194,44 @@ function getDashboardHTML(section: string): string {
 </div>
 
 <script>
+  // ---- Auth guard -----------------------------------------
+  const siqToken = localStorage.getItem('siq_token');
+  const siqUser  = JSON.parse(localStorage.getItem('siq_user') || 'null');
+  const siqTenant = JSON.parse(localStorage.getItem('siq_tenant') || 'null');
+
+  if (!siqToken) { window.location.href = '/login'; }
+
+  // ---- Populate user info ---------------------------------
+  if (siqUser) {
+    const initials = ((siqUser.first_name||'')[0]||('')+((siqUser.last_name||'')[0]||'')).toUpperCase();
+    const el = document.getElementById('user-avatar');
+    if (el) el.textContent = initials || '--';
+    const nameEl = document.getElementById('user-name');
+    if (nameEl) nameEl.textContent = (siqUser.first_name + ' ' + siqUser.last_name).trim() || siqUser.email;
+    const roleEl = document.getElementById('user-role');
+    if (roleEl) roleEl.textContent = siqUser.role || 'agent';
+  }
+  if (siqTenant) {
+    const wsName = document.getElementById('ws-name');
+    if (wsName) wsName.textContent = siqTenant.name || 'Workspace';
+    const wsInit = document.getElementById('ws-initials');
+    if (wsInit) wsInit.textContent = (siqTenant.name||'WS').slice(0,2).toUpperCase();
+  }
+
+  function handleLogout() {
+    localStorage.removeItem('siq_token');
+    localStorage.removeItem('siq_user');
+    localStorage.removeItem('siq_tenant');
+    window.location.href = '/';
+  }
+
+  function authFetch(url, opts = {}) {
+    return fetch(url, {
+      ...opts,
+      headers: { 'Authorization': 'Bearer ' + siqToken, 'Content-Type': 'application/json', ...(opts.headers || {}) }
+    });
+  }
+
   function toggleSidebar() {
     document.getElementById('sidebar').classList.toggle('open');
   }
@@ -1132,17 +1251,19 @@ function getDashboardHTML(section: string): string {
   
   // Render charts if chart elements exist
   if (document.getElementById('volumeChart')) {
-    const ctx = document.getElementById('volumeChart').getContext('2d');
-    new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
-        datasets: [{
-          label: 'Tickets',
-          data: [42, 58, 35, 71, 63, 48, 55, 67, 72, 61, 54, 49],
-          borderColor: '#6a4cf5',
-          backgroundColor: 'rgba(106,76,245,0.1)',
-          borderWidth: 2,
+    // Fetch real stats then draw chart
+    authFetch('/api/stats').then(r => r.json()).then(data => {
+      const ctx = document.getElementById('volumeChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+          datasets: [{
+            label: 'Tickets',
+            data: data.ticketVolume || [0,0,0,0,0,0,0,0,0,0,0,0],
+            borderColor: '#6a4cf5',
+            backgroundColor: 'rgba(106,76,245,0.1)',
+            borderWidth: 2,
           fill: true,
           tension: 0.4,
           pointBackgroundColor: '#6a4cf5',
@@ -1171,28 +1292,32 @@ function getDashboardHTML(section: string): string {
         }
       }
     });
+    }).catch(() => {});
   }
   
   if (document.getElementById('aiChart')) {
-    const ctx = document.getElementById('aiChart').getContext('2d');
-    new Chart(ctx, {
-      type: 'doughnut',
-      data: {
-        labels: ['AI Resolved', 'Escalated', 'Human'],
-        datasets: [{
-          data: [78, 12, 10],
-          backgroundColor: ['#22c55e', '#ff7a3d', '#6a4cf5'],
-          borderWidth: 0,
-          hoverOffset: 4,
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        cutout: '70%',
-        plugins: { legend: { position: 'bottom', labels: { color: '#666', font: { family: 'Inter', size: 12 }, boxWidth: 10, padding: 16 } } }
-      }
-    });
+    authFetch('/api/stats').then(r => r.json()).then(data => {
+      const bd = data.resolutionBreakdown || {};
+      const ctx = document.getElementById('aiChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['AI Resolved', 'Escalated', 'Pending'],
+          datasets: [{
+            data: [bd.resolved || 0, bd.escalated || 0, bd.pending || 0],
+            backgroundColor: ['#22c55e', '#ff7a3d', '#6a4cf5'],
+            borderWidth: 0,
+            hoverOffset: 4,
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          cutout: '70%',
+          plugins: { legend: { position: 'bottom', labels: { color: '#666', font: { family: 'Inter', size: 12 }, boxWidth: 10, padding: 16 } } }
+        }
+      });
+    }).catch(() => {});
   }
 </script>
 </body>
@@ -1577,38 +1702,17 @@ function getKnowledgeBaseContent(): string {
     <button class="btn-primary" onclick="showUploadModal()"><i class="fas fa-plus"></i> New Knowledge Base</button>
   </div>
   
-  <!-- KB Cards -->
-  <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 32px;">
-    ${[
-      { name: 'Product Documentation', docs: 24, chunks: 847, status: 'indexed', updated: '2h ago', color: '#6a4cf5' },
-      { name: 'FAQ & Help Center', docs: 12, chunks: 312, status: 'indexed', updated: '1d ago', color: '#d44df0' },
-      { name: 'API Reference', docs: 8, chunks: 0, status: 'indexing', updated: 'just now', color: '#0099ff' },
-    ].map(kb => `
-    <div class="card" style="padding: 24px; cursor: pointer;" onmouseover="this.style.borderColor='#262626'" onmouseout="this.style.borderColor='#1a1a1a'">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px;">
-        <div style="width: 40px; height: 40px; background: ${kb.color}22; border-radius: 10px; display: flex; align-items: center; justify-content: center;">
-          <i class="fas fa-book" style="color: ${kb.color}; font-size: 16px;"></i>
-        </div>
-        <span style="font-size: 11px; background: ${kb.status === 'indexed' ? 'rgba(34,197,94,0.15)' : 'rgba(255,122,61,0.15)'}; color: ${kb.status === 'indexed' ? '#22c55e' : '#ff7a3d'}; padding: 3px 10px; border-radius: 100px; display: flex; align-items: center; gap: 4px;">
-          ${kb.status === 'indexing' ? '<i class="fas fa-spinner fa-spin" style="font-size: 10px;"></i>' : '●'} ${kb.status}
-        </span>
-      </div>
-      <h3 style="font-size: 15px; font-weight: 600; margin-bottom: 8px;">${kb.name}</h3>
-      <div style="display: flex; gap: 16px; margin-bottom: 16px;">
-        <div><div style="font-size: 18px; font-weight: 700;">${kb.docs}</div><div style="font-size: 11px; color: #666;">Documents</div></div>
-        <div><div style="font-size: 18px; font-weight: 700;">${kb.chunks || '...'}</div><div style="font-size: 11px; color: #666;">Chunks</div></div>
-      </div>
-      <div style="font-size: 12px; color: #555; margin-bottom: 16px;">Updated ${kb.updated}</div>
-      <div style="display: flex; gap: 8px;">
-        <button class="btn-secondary" style="font-size: 12px; padding: 6px 14px;"><i class="fas fa-upload"></i> Upload</button>
-        <button class="btn-secondary" style="font-size: 12px; padding: 6px 14px;"><i class="fas fa-sync"></i> Re-index</button>
-      </div>
-    </div>`).join('')}
+  <!-- KB Cards (populated by JS) -->
+  <div id="kb-cards-container" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 32px;">
+    <div style="color: #555; font-size: 13px; grid-column: 1/-1; padding: 20px 0;"><i class="fas fa-spinner fa-spin" style="margin-right: 8px;"></i>Loading knowledge bases...</div>
   </div>
   
   <!-- Upload area -->
   <div class="card" style="padding: 32px;" id="upload-area">
-    <h2 style="font-size: 16px; font-weight: 600; margin-bottom: 20px;">Upload Documents</h2>
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+      <h2 style="font-size: 16px; font-weight: 600;">Upload Documents</h2>
+      <span id="selected-kb-name" style="font-size: 12px; color: #6a4cf5; background: rgba(106,76,245,0.1); padding: 4px 12px; border-radius: 100px;">Select a knowledge base above first</span>
+    </div>
     
     <div style="border: 2px dashed #262626; border-radius: 16px; padding: 48px; text-align: center; cursor: pointer; transition: all 0.2s;" 
          id="drop-zone"
@@ -1638,47 +1742,107 @@ function getKnowledgeBaseContent(): string {
   </div>
   
   <script>
+    // Load KBs and render cards dynamically
+    const kbToken = localStorage.getItem('siq_token');
+
+    function kbFetch(url, opts = {}) {
+      return fetch(url, { ...opts, headers: { 'Authorization': 'Bearer ' + kbToken, ...(opts.headers || {}) } });
+    }
+
+    let selectedKbId = null;
+
+    async function loadKBs() {
+      try {
+        const res = await kbFetch('/api/knowledge-bases');
+        const data = await res.json();
+        const container = document.getElementById('kb-cards-container');
+        if (!container || !data.kbs) return;
+        if (data.kbs.length === 0) {
+          container.innerHTML = '<p style="color:#666;font-size:13px;">No knowledge bases yet. Create one to get started.</p>';
+          return;
+        }
+        container.innerHTML = data.kbs.map(kb => \`
+          <div class="card" style="padding: 24px; cursor: pointer;" onclick="selectKB('\${kb.id}', '\${kb.name}')">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px;">
+              <div style="width: 40px; height: 40px; background: \${kb.color}22; border-radius: 10px; display: flex; align-items: center; justify-content: center;">
+                <i class="fas fa-book" style="color: \${kb.color}; font-size: 16px;"></i>
+              </div>
+              <span style="font-size: 11px; background: \${kb.status === 'indexed' ? 'rgba(34,197,94,0.15)' : 'rgba(255,122,61,0.15)'}; color: \${kb.status === 'indexed' ? '#22c55e' : '#ff7a3d'}; padding: 3px 10px; border-radius: 100px;">\${kb.status}</span>
+            </div>
+            <h3 style="font-size: 15px; font-weight: 600; margin-bottom: 8px;">\${kb.name}</h3>
+            <div style="display: flex; gap: 16px; margin-bottom: 16px;">
+              <div><div style="font-size: 18px; font-weight: 700;">\${kb.doc_count || 0}</div><div style="font-size: 11px; color: #666;">Documents</div></div>
+            </div>
+            <div style="display: flex; gap: 8px;">
+              <button class="btn-secondary" style="font-size: 12px; padding: 6px 14px;" onclick="event.stopPropagation(); selectKB('\${kb.id}','\${kb.name}')"><i class="fas fa-upload"></i> Upload</button>
+              <button class="btn-secondary" style="font-size: 12px; padding: 6px 14px; color: #ff5577; border-color: rgba(255,85,119,0.3);" onclick="event.stopPropagation(); deleteKB('\${kb.id}')"><i class="fas fa-trash"></i></button>
+            </div>
+          </div>\`).join('');
+      } catch(e) { console.error(e); }
+    }
+
+    function selectKB(id, name) {
+      selectedKbId = id;
+      document.getElementById('selected-kb-name').textContent = 'Upload to: ' + name;
+      document.getElementById('upload-area').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    async function deleteKB(id) {
+      if (!confirm('Delete this knowledge base and all its documents?')) return;
+      await kbFetch('/api/knowledge-bases/' + id, { method: 'DELETE' });
+      loadKBs();
+    }
+
     function handleDrop(e) {
       e.preventDefault();
       const files = e.dataTransfer.files;
-      if (files.length) simulateUpload(files[0].name);
+      if (files.length) uploadFile(files[0]);
     }
     
     function handleFileSelect(e) {
-      if (e.target.files.length) simulateUpload(e.target.files[0].name);
+      if (e.target.files.length) uploadFile(e.target.files[0]);
     }
-    
-    function simulateUpload(filename) {
+
+    async function uploadFile(file) {
+      if (!selectedKbId) {
+        alert('Please select a knowledge base first by clicking on one above.');
+        return;
+      }
       const progress = document.getElementById('upload-progress');
       const bar = document.getElementById('progress-bar');
       const pct = document.getElementById('upload-pct');
       const fname = document.getElementById('upload-filename');
       const status = document.getElementById('upload-status');
-      
       progress.style.display = 'block';
-      fname.textContent = filename;
-      
-      const stages = [
-        { p: 20, s: 'Uploading...' },
-        { p: 45, s: 'Chunking (~500 tokens/segment)...' },
-        { p: 70, s: 'Generating embeddings (OpenAI)...' },
-        { p: 90, s: 'Storing in vector database (Qdrant)...' },
-        { p: 100, s: '✓ Indexed successfully! 127 chunks stored.' },
-      ];
-      
-      let i = 0;
-      const interval = setInterval(() => {
-        if (i >= stages.length) { clearInterval(interval); return; }
-        bar.style.width = stages[i].p + '%';
-        pct.textContent = stages[i].p + '%';
-        status.textContent = stages[i].s;
-        i++;
-      }, 600);
+      fname.textContent = file.name;
+      bar.style.width = '10%'; pct.textContent = '10%'; status.textContent = 'Uploading to R2...';
+
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        bar.style.width = '40%'; pct.textContent = '40%';
+        const res = await fetch('/api/knowledge-bases/' + selectedKbId + '/upload', {
+          method: 'POST',
+          headers: { 'Authorization': 'Bearer ' + kbToken },
+          body: formData
+        });
+        bar.style.width = '80%'; pct.textContent = '80%'; status.textContent = 'Processing...';
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Upload failed');
+        bar.style.width = '100%'; pct.textContent = '100%';
+        status.textContent = '✓ Indexed successfully! ' + data.chunk_count + ' chunks stored.';
+        loadKBs();
+      } catch(err) {
+        status.textContent = '✗ Error: ' + err.message;
+        bar.style.background = '#ff5577';
+      }
     }
     
     function showUploadModal() {
       document.getElementById('upload-area').scrollIntoView({ behavior: 'smooth' });
     }
+
+    loadKBs();
   </script>`
 }
 
