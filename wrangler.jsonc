@@ -10,7 +10,7 @@
     {
       "binding": "DB",
       "database_name": "supportiq-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "database_id": "372b1c5c-9662-468f-a92f-f38420b24c15",
       "migrations_dir": "migrations"
     }
   ],
