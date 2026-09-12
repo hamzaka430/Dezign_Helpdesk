@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "supportiq",
-  "compatibility_date": "2024-01-01",
+  "compatibility_date": "2024-09-02",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": ["nodejs_compat"],
 
@@ -26,8 +26,49 @@
 
   // ---- Environment Variables (non-secret) -----------------
   "vars": {
-    "ENVIRONMENT": "production"
+    "ENVIRONMENT": "production",
+    "APP_URL": "https://supportiq.pages.dev",
+    // Set to "true" to enable subdomain-based tenant routing (e.g. acme.supportiq.pages.dev)
+    "TENANT_SUBDOMAIN_ENABLED": "false"
   }
+
   // ---- Secrets (set via wrangler CLI) ---------------------
-  // JWT_SECRET: wrangler pages secret put JWT_SECRET
+  // ================================================================
+  // REQUIRED — must set before first deploy:
+  // ================================================================
+  //   wrangler pages secret put JWT_SECRET
+  //     → Any long random string, e.g.:  openssl rand -hex 32
+  //
+  // ================================================================
+  // PHASE 2 — AI & Vector Search (set to enable real AI responses):
+  // ================================================================
+  //   wrangler pages secret put OPENAI_API_KEY
+  //     → From https://platform.openai.com/api-keys
+  //   wrangler pages secret put QDRANT_URL
+  //     → Your Qdrant cloud cluster URL, e.g. https://xyz.qdrant.io
+  //   wrangler pages secret put QDRANT_API_KEY
+  //     → From https://cloud.qdrant.io
+  //
+  // ================================================================
+  // PHASE 4 — Billing (set to enable Stripe payments):
+  // ================================================================
+  //   wrangler pages secret put STRIPE_SECRET_KEY
+  //     → From https://dashboard.stripe.com/apikeys (sk_live_...)
+  //   wrangler pages secret put STRIPE_WEBHOOK_SECRET
+  //     → Webhook signing secret from Stripe Dashboard → Webhooks
+  //     → Endpoint: https://YOUR_DOMAIN/api/billing/webhook
+  //     → Events: checkout.session.completed, customer.subscription.deleted
+  //
+  // ================================================================
+  // PHASE 4 — Email Notifications (optional):
+  // ================================================================
+  //   wrangler pages secret put RESEND_API_KEY
+  //     → From https://resend.com/api-keys
+  //
+  // ================================================================
+  // PHASE 6 — Slack Integration (optional):
+  // ================================================================
+  //   wrangler pages secret put SLACK_BOT_TOKEN
+  //     → From https://api.slack.com/apps → OAuth Tokens (xoxb-...)
+  //     → Required scopes: chat:write, channels:read
 }

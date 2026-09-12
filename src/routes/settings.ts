@@ -48,8 +48,20 @@ settings.patch('/', adminOnly, async (c) => {
       ai_welcome_message?: string
       allow_human_request?: boolean
       widget_color?: string
+      widget_primary_color?: string
+      widget_greeting?: string
+      widget_placeholder?: string
+      widget_position?: string
+      email_notifications?: boolean
+      notification_email?: string
+      slack_webhook_url?: string
       timezone?: string
       workspace_name?: string
+      sso_enabled?: boolean
+      sso_provider?: string
+      sso_metadata_url?: string
+      sso_entity_id?: string
+      sso_enforce?: boolean
     }>()
 
     const db = new DB(c.env.DB)

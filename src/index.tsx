@@ -7,6 +7,10 @@ import knowledgeRoutes from './routes/knowledge'
 import conversationRoutes from './routes/conversations'
 import settingsRoutes from './routes/settings'
 import statsRoutes from './routes/stats'
+import chatRoutes from './routes/chat'
+import billingRoutes from './routes/billing'
+import widgetRoutes from './routes/widget'
+import integrationsRoutes from './routes/integrations'
 import type { Env } from './lib/middleware'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -15,7 +19,7 @@ const app = new Hono<{ Bindings: Env }>()
 app.use('/api/*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }))
 
 // ---- Static & Favicon --------------------------------------
@@ -30,61 +34,30 @@ app.get('/favicon.svg', (c) => {
 // ---- Health ------------------------------------------------
 app.get('/api/health', (c) => c.json({
   status: 'ok', service: 'SupportIQ',
-  version: '1.1.0',
+  version: '2.0.0',
   db: c.env.DB ? 'connected' : 'not_configured',
   storage: c.env.STORAGE ? 'connected' : 'not_configured',
+  ai: c.env.OPENAI_API_KEY ? 'enabled' : 'disabled',
+  vector_search: !!(c.env.QDRANT_URL && c.env.QDRANT_API_KEY),
   timestamp: new Date().toISOString()
 }))
 
-// ---- API Routes (Real — Phase 1) ---------------------------
+// ---- API Routes --------------------------------------------
+// Phase 1: Core
 app.route('/api/auth', authRoutes)
 app.route('/api/tickets', ticketRoutes)
 app.route('/api/knowledge-bases', knowledgeRoutes)
 app.route('/api/conversations', conversationRoutes)
 app.route('/api/settings', settingsRoutes)
 app.route('/api/stats', statsRoutes)
-
-// ---- Legacy /api/chat (Phase 2 will replace with real RAG) -
-app.post('/api/chat', async (c) => {
-  const body = await c.req.json()
-  const { message, conversation_id } = body
-
-  // Phase 2: replace with real OpenAI + Qdrant RAG
-  await new Promise(r => setTimeout(r, 400))
-
-  const responses = [
-    { content: "I found this in our documentation: The password reset process takes 5-10 minutes. Check your spam folder if you don't receive the email. You can also try the 'Magic Link' login option.", confidence: 0.92, sources: ['Password Reset Guide', 'Account Settings FAQ'] },
-    { content: "Based on our knowledge base, billing charges are processed on the 1st of each month. If you see a discrepancy, please provide your invoice number and I'll help resolve it.", confidence: 0.87, sources: ['Billing FAQ'] },
-    { content: "I wasn't able to find a specific answer to your question in our knowledge base. Let me connect you with a human agent who can better assist you.", confidence: 0.23, sources: [], escalate: true },
-  ]
-
-  const response = message.toLowerCase().includes('billing') ? responses[1] :
-    message.toLowerCase().includes('password') ? responses[0] : responses[2]
-
-  // If conversation_id given and DB available, persist the messages
-  if (conversation_id && c.env.DB) {
-    try {
-      const { DB: db_lib } = await import('./lib/db')
-      const { generateId } = await import('./lib/auth')
-      const db = new db_lib(c.env.DB)
-      await db.createMessage({
-        id: generateId('msg'), conversation_id,
-        tenant_id: 'tenant_demo_001',
-        sender_type: 'customer', content: message
-      })
-      await db.createMessage({
-        id: generateId('msg'), conversation_id,
-        tenant_id: 'tenant_demo_001',
-        sender_type: 'ai', content: response.content,
-        confidence: response.confidence,
-        sources: (response as any).sources || [],
-        escalate: (response as any).escalate || false
-      })
-    } catch (e) { /* non-fatal */ }
-  }
-
-  return c.json(response)
-})
+// Phase 2: AI
+app.route('/api/chat', chatRoutes)
+// Phase 4: Billing
+app.route('/api/billing', billingRoutes)
+// Phase 5: Widget
+app.route('/api/widget', widgetRoutes)
+// Phase 6: Integrations (Slack, Webhooks, SSO)
+app.route('/api/integrations', integrationsRoutes)
 
 // ---- Page Routes -------------------------------------------
 const pages = ['/', '/pricing', '/login', '/signup', '/dashboard', '/dashboard/inbox', '/dashboard/tickets', '/dashboard/knowledge-base', '/dashboard/analytics', '/dashboard/settings', '/widget']
@@ -1326,56 +1299,29 @@ function getDashboardHTML(section: string): string {
 
 function getDashboardOverview(): string {
   return `
-  <div style="margin-bottom: 28px;">
-    <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Overview</h1>
-    <p style="font-size: 14px; color: #666;">Welcome back, Alex. Here's what's happening today.</p>
+  <div style="margin-bottom: 28px; display:flex; justify-content:space-between; align-items:center;">
+    <div>
+      <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Overview</h1>
+      <p style="font-size: 14px; color: #666;" id="welcome-msg">Welcome back! Here's what's happening today.</p>
+    </div>
+    <div id="ai-status-badge" style="display:flex; align-items:center; gap:6px; background:rgba(34,197,94,0.1); border:1px solid rgba(34,197,94,0.2); border-radius:100px; padding:6px 14px; font-size:12px; color:#22c55e;">
+      <div style="width:6px; height:6px; background:#22c55e; border-radius:50%;"></div>
+      <span id="ai-status-text">Checking AI...</span>
+    </div>
   </div>
   
-  <!-- Stats -->
-  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px;">
-    <div class="card stat-card">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
-        <div style="width: 36px; height: 36px; background: rgba(106,76,245,0.15); border-radius: 10px; display: flex; align-items: center; justify-content: center;">
-          <i class="fas fa-ticket" style="color: #6a4cf5; font-size: 14px;"></i>
+  <!-- Stats (loaded from API) -->
+  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px;" id="stats-grid">
+    ${['fa-ticket #6a4cf5', 'fa-robot #22c55e', 'fa-comments #0099ff', 'fa-check-circle #ff7a3d'].map((icon) => {
+      const [ic, col] = icon.split(' ')
+      return `<div class="card stat-card">
+        <div style="width:36px; height:36px; background:${col}22; border-radius:10px; display:flex; align-items:center; justify-content:center; margin-bottom:12px;">
+          <i class="fas ${ic}" style="color:${col}; font-size:14px;"></i>
         </div>
-        <span style="background: rgba(34,197,94,0.15); color: #22c55e; font-size: 11px; padding: 3px 8px; border-radius: 100px;">↑ 12%</span>
-      </div>
-      <div style="font-size: 28px; font-weight: 700; letter-spacing: -1px;">1,284</div>
-      <div style="font-size: 13px; color: #666; margin-top: 2px;">Total Tickets</div>
-    </div>
-    
-    <div class="card stat-card">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
-        <div style="width: 36px; height: 36px; background: rgba(34,197,94,0.15); border-radius: 10px; display: flex; align-items: center; justify-content: center;">
-          <i class="fas fa-robot" style="color: #22c55e; font-size: 14px;"></i>
-        </div>
-        <span style="background: rgba(34,197,94,0.15); color: #22c55e; font-size: 11px; padding: 3px 8px; border-radius: 100px;">↑ 4.2%</span>
-      </div>
-      <div style="font-size: 28px; font-weight: 700; letter-spacing: -1px;">78.4%</div>
-      <div style="font-size: 13px; color: #666; margin-top: 2px;">AI Resolution Rate</div>
-    </div>
-    
-    <div class="card stat-card">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
-        <div style="width: 36px; height: 36px; background: rgba(0,153,255,0.15); border-radius: 10px; display: flex; align-items: center; justify-content: center;">
-          <i class="fas fa-clock" style="color: #0099ff; font-size: 14px;"></i>
-        </div>
-        <span style="background: rgba(34,197,94,0.15); color: #22c55e; font-size: 11px; padding: 3px 8px; border-radius: 100px;">↓ 18%</span>
-      </div>
-      <div style="font-size: 28px; font-weight: 700; letter-spacing: -1px;">2m 34s</div>
-      <div style="font-size: 13px; color: #666; margin-top: 2px;">Avg Response Time</div>
-    </div>
-    
-    <div class="card stat-card">
-      <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;">
-        <div style="width: 36px; height: 36px; background: rgba(255,122,61,0.15); border-radius: 10px; display: flex; align-items: center; justify-content: center;">
-          <i class="fas fa-star" style="color: #ff7a3d; font-size: 14px;"></i>
-        </div>
-        <span style="background: rgba(34,197,94,0.15); color: #22c55e; font-size: 11px; padding: 3px 8px; border-radius: 100px;">↑ 0.3</span>
-      </div>
-      <div style="font-size: 28px; font-weight: 700; letter-spacing: -1px;">4.7★</div>
-      <div style="font-size: 13px; color: #666; margin-top: 2px;">CSAT Score</div>
-    </div>
+        <div style="font-size:28px; font-weight:700; letter-spacing:-1px; background:#1a1a1a; border-radius:6px; height:36px; animation: shimmer 1.5s infinite; background:linear-gradient(90deg,#1a1a1a 25%,#262626 50%,#1a1a1a 75%); background-size:200% 100%;"></div>
+        <div style="font-size:13px; color:#555; margin-top:8px; background:#1a1a1a; border-radius:4px; height:14px; width:70%;"></div>
+      </div>`
+    }).join('')}
   </div>
   
   <!-- Charts Row -->
@@ -1383,68 +1329,122 @@ function getDashboardOverview(): string {
     <div class="card" style="padding: 24px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h2 style="font-size: 15px; font-weight: 600;">Ticket Volume</h2>
-        <select style="background: #1c1c1c; border: 1px solid #262626; border-radius: 8px; padding: 6px 12px; color: #999; font-size: 12px; outline: none; cursor: pointer;">
-          <option>Last 12 months</option>
-          <option>Last 30 days</option>
-          <option>Last 7 days</option>
-        </select>
+        <span style="font-size:11px; color:#555;">Last 12 months</span>
       </div>
       <div style="height: 200px;"><canvas id="volumeChart"></canvas></div>
     </div>
-    
     <div class="card" style="padding: 24px;">
       <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 20px;">Resolution Breakdown</h2>
       <div style="height: 160px;"><canvas id="aiChart"></canvas></div>
     </div>
   </div>
   
-  <!-- Recent Tickets -->
+  <!-- Recent Tickets (loaded from API) -->
   <div class="card">
     <div style="display: flex; justify-content: space-between; align-items: center; padding: 20px 20px 16px;">
       <h2 style="font-size: 15px; font-weight: 600;">Recent Tickets</h2>
       <a href="/dashboard/tickets" style="font-size: 13px; color: #0099ff; text-decoration: none;">View all →</a>
     </div>
-    
-    <div class="ticket-row" onclick="window.location.href='/dashboard/inbox'">
-      <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #ff5577, #ff7a3d); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0;">SK</div>
-      <div style="flex: 1; min-width: 0;">
-        <div style="font-size: 13px; font-weight: 500;">Unable to reset password</div>
-        <div style="font-size: 12px; color: #666;">Sarah K. • 2h ago</div>
-      </div>
-      <span class="badge badge-urgent">Urgent</span>
-      <span class="badge badge-open" style="margin-left: 8px;">Open</span>
+    <div id="recent-tickets-body">
+      <div style="padding:20px; text-align:center; color:#555;"><i class="fas fa-spinner fa-spin"></i></div>
     </div>
+  </div>
+  
+  <script>
+    // Update welcome message
+    if (siqUser) {
+      const name = (siqUser.first_name||siqUser.email||'').split(' ')[0] || 'there';
+      document.getElementById('welcome-msg').textContent = 'Welcome back, ' + name + '! Here\\'s what\\'s happening today.';
+    }
     
-    <div class="ticket-row" onclick="window.location.href='/dashboard/inbox'">
-      <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0;">JR</div>
-      <div style="flex: 1; min-width: 0;">
-        <div style="font-size: 13px; font-weight: 500;">Billing charge discrepancy</div>
-        <div style="font-size: 12px; color: #666;">James R. • 3h ago</div>
-      </div>
-      <span class="badge badge-high">High</span>
-      <span class="badge badge-progress" style="margin-left: 8px;">In Progress</span>
-    </div>
+    // Check AI status
+    fetch('/api/chat/status').then(r=>r.json()).then(s => {
+      const el = document.getElementById('ai-status-text');
+      const badge = document.getElementById('ai-status-badge');
+      if (s.ai_enabled) {
+        el.textContent = 'AI Active (' + s.model + ')';
+      } else {
+        el.textContent = 'AI Not Configured';
+        badge.style.background = 'rgba(255,85,119,0.1)';
+        badge.style.borderColor = 'rgba(255,85,119,0.2)';
+        badge.style.color = '#ff5577';
+        badge.querySelector('div').style.background = '#ff5577';
+      }
+    }).catch(()=>{});
     
-    <div class="ticket-row" onclick="window.location.href='/dashboard/inbox'">
-      <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #0099ff, #6a4cf5); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0;">DC</div>
-      <div style="flex: 1; min-width: 0;">
-        <div style="font-size: 13px; font-weight: 500;">API integration help needed</div>
-        <div style="font-size: 12px; color: #666;">Dev Corp • 5h ago</div>
-      </div>
-      <span class="badge badge-medium">Medium</span>
-      <span class="badge badge-open" style="margin-left: 8px;">Open</span>
-    </div>
+    function timeAgo(d) {
+      if (!d) return '';
+      const diff = Date.now() - new Date(d).getTime();
+      const m = Math.floor(diff/60000);
+      if (m < 60) return m + 'm ago';
+      const h = Math.floor(m/60);
+      if (h < 24) return h + 'h ago';
+      return Math.floor(h/24) + 'd ago';
+    }
     
-    <div class="ticket-row" onclick="window.location.href='/dashboard/inbox'">
-      <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #22c55e, #0099ff); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; flex-shrink: 0;">ET</div>
-      <div style="flex: 1; min-width: 0;">
-        <div style="font-size: 13px; font-weight: 500;">Feature request: dark mode</div>
-        <div style="font-size: 12px; color: #666;">Emily T. • 1d ago</div>
-      </div>
-      <span class="badge badge-low">Low</span>
-      <span class="badge badge-resolved" style="margin-left: 8px;">Resolved</span>
-    </div>
-  </div>`
+    // Load real stats
+    authFetch('/api/stats').then(r=>r.json()).then(data => {
+      const t = data.tickets || {};
+      const bd = data.resolutionBreakdown || {};
+      const aiRate = t.total > 0 ? Math.round((bd.resolved||0)/Math.max(t.total,1)*100) : 0;
+      
+      document.getElementById('stats-grid').innerHTML = \`
+        <div class="card stat-card">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+            <div style="width:36px; height:36px; background:rgba(106,76,245,0.15); border-radius:10px; display:flex; align-items:center; justify-content:center;"><i class="fas fa-ticket" style="color:#6a4cf5; font-size:14px;"></i></div>
+          </div>
+          <div style="font-size:28px; font-weight:700; letter-spacing:-1px;">\${(t.total||0).toLocaleString()}</div>
+          <div style="font-size:13px; color:#666; margin-top:2px;">Total Tickets</div>
+          <div style="font-size:11px; color:#555; margin-top:6px;">Open: \${t.open||0} · Resolved: \${t.resolved||0}</div>
+        </div>
+        <div class="card stat-card">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+            <div style="width:36px; height:36px; background:rgba(34,197,94,0.15); border-radius:10px; display:flex; align-items:center; justify-content:center;"><i class="fas fa-robot" style="color:#22c55e; font-size:14px;"></i></div>
+          </div>
+          <div style="font-size:28px; font-weight:700; letter-spacing:-1px;">\${aiRate}%</div>
+          <div style="font-size:13px; color:#666; margin-top:2px;">AI Resolution Rate</div>
+          <div style="font-size:11px; color:#555; margin-top:6px;">Escalated: \${bd.escalated||0} · Pending: \${bd.pending||0}</div>
+        </div>
+        <div class="card stat-card">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+            <div style="width:36px; height:36px; background:rgba(0,153,255,0.15); border-radius:10px; display:flex; align-items:center; justify-content:center;"><i class="fas fa-comments" style="color:#0099ff; font-size:14px;"></i></div>
+          </div>
+          <div style="font-size:28px; font-weight:700; letter-spacing:-1px;">\${(data.conversations?.open||0).toLocaleString()}</div>
+          <div style="font-size:13px; color:#666; margin-top:2px;">Open Conversations</div>
+        </div>
+        <div class="card stat-card">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+            <div style="width:36px; height:36px; background:rgba(255,122,61,0.15); border-radius:10px; display:flex; align-items:center; justify-content:center;"><i class="fas fa-check-circle" style="color:#ff7a3d; font-size:14px;"></i></div>
+          </div>
+          <div style="font-size:28px; font-weight:700; letter-spacing:-1px;">\${t.in_progress||0}</div>
+          <div style="font-size:13px; color:#666; margin-top:2px;">In Progress</div>
+        </div>\`;
+    }).catch(()=>{});
+    
+    // Load recent tickets
+    authFetch('/api/tickets?limit=5').then(r=>r.json()).then(data => {
+      const tickets = data.tickets || [];
+      if (!tickets.length) {
+        document.getElementById('recent-tickets-body').innerHTML = '<div style="padding:24px; text-align:center; color:#555; font-size:13px;">No tickets yet. <a href="/dashboard/tickets" style="color:#0099ff;">Create your first one →</a></div>';
+        return;
+      }
+      const pBadge = p => ({urgent:'badge-urgent',high:'badge-high',medium:'badge-medium',low:'badge-low'})[p]||'badge-low';
+      const sBadge = s => ({open:'badge-open',in_progress:'badge-progress',resolved:'badge-resolved'})[s]||'badge-low';
+      const sLabel = s => ({open:'Open',in_progress:'In Progress',resolved:'Resolved',closed:'Closed'})[s]||s;
+      document.getElementById('recent-tickets-body').innerHTML = tickets.map(t => \`
+        <div class="ticket-row" onclick="window.location.href='/dashboard/tickets'">
+          <div style="width:32px; height:32px; background:linear-gradient(135deg,#6a4cf5,#d44df0); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:600; flex-shrink:0;">\${(t.customer_name||'?').slice(0,2).toUpperCase()}</div>
+          <div style="flex:1; min-width:0;">
+            <div style="font-size:13px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">\${t.subject}</div>
+            <div style="font-size:12px; color:#666;">\${t.customer_name||t.customer_email||'Unknown'} • \${timeAgo(t.created_at)}</div>
+          </div>
+          <span class="badge \${pBadge(t.priority)}">\${(t.priority||'').charAt(0).toUpperCase()+(t.priority||'').slice(1)}</span>
+          <span class="badge \${sBadge(t.status)}" style="margin-left:8px;">\${sLabel(t.status)}</span>
+        </div>\`).join('');
+    }).catch(()=>{
+      document.getElementById('recent-tickets-body').innerHTML = '<div style="padding:20px; color:#555; font-size:13px; text-align:center;">No tickets data available</div>';
+    });
+  </script>`
 }
 
 function getInboxContent(): string {
@@ -1452,167 +1452,67 @@ function getInboxContent(): string {
   <div style="margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center;">
     <div>
       <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Inbox</h1>
-      <p style="font-size: 14px; color: #666;">12 unread conversations</p>
+      <p style="font-size: 14px; color: #666;" id="inbox-count">Loading conversations...</p>
     </div>
     <div style="display: flex; gap: 8px;">
-      <button class="btn-secondary"><i class="fas fa-filter"></i> Filter</button>
-      <button class="btn-primary"><i class="fas fa-plus"></i> New Ticket</button>
+      <button class="btn-secondary" onclick="loadConversations()"><i class="fas fa-refresh"></i> Refresh</button>
     </div>
   </div>
   
   <div style="display: grid; grid-template-columns: 320px 1fr; gap: 16px; height: calc(100vh - 180px);">
     <!-- Conversation list -->
-    <div class="card" style="overflow-y: auto;">
+    <div class="card" style="overflow-y: auto; display:flex; flex-direction:column;">
       <!-- Tabs -->
-      <div style="display: flex; border-bottom: 1px solid #1a1a1a; padding: 4px;">
-        <button onclick="setTab(this, 'all')" style="flex: 1; background: #1c1c1c; border: none; color: #fff; padding: 8px; font-size: 12px; cursor: pointer; border-radius: 6px; font-family: inherit;">All (12)</button>
-        <button onclick="setTab(this, 'ai')" style="flex: 1; background: none; border: none; color: #666; padding: 8px; font-size: 12px; cursor: pointer; border-radius: 6px; font-family: inherit;">AI Chats</button>
-        <button onclick="setTab(this, 'escalated')" style="flex: 1; background: none; border: none; color: #666; padding: 8px; font-size: 12px; cursor: pointer; border-radius: 6px; font-family: inherit;">Escalated</button>
+      <div style="display: flex; border-bottom: 1px solid #1a1a1a; padding: 4px; flex-shrink:0;">
+        <button id="tab-all" onclick="setConvTab('all')" style="flex:1; background:#1c1c1c; border:none; color:#fff; padding:8px; font-size:12px; cursor:pointer; border-radius:6px; font-family:inherit;">All</button>
+        <button id="tab-escalated" onclick="setConvTab('escalated')" style="flex:1; background:none; border:none; color:#666; padding:8px; font-size:12px; cursor:pointer; border-radius:6px; font-family:inherit;">Escalated</button>
+        <button id="tab-resolved" onclick="setConvTab('resolved')" style="flex:1; background:none; border:none; color:#666; padding:8px; font-size:12px; cursor:pointer; border-radius:6px; font-family:inherit;">Resolved</button>
       </div>
-      
-      <!-- Conversations -->
-      ${['Sarah K.', 'James R.', 'Dev Corp', 'Emily T.', 'TechStart', 'Mike Chen', 'Diana P.', 'Robert L.'].map((name, i) => {
-        const statuses = ['AI → Human', 'Escalated', 'AI Chat', 'AI Chat', 'Escalated', 'AI Chat', 'AI Chat', 'Resolved']
-        const times = ['2m ago', '15m ago', '1h ago', '2h ago', '3h ago', '5h ago', '1d ago', '2d ago']
-        const previews = [
-          "I still haven't received the reset email...",
-          "This charge doesn't match my invoice",
-          "The API endpoint returns 401 error",
-          "Can you add dark mode?",
-          "Need to export all data ASAP",
-          "Integration with Zapier?",
-          "How do I upgrade my plan?",
-          "Thank you for your help!"
-        ]
-        const unread = i < 3
-        return `
-        <div onclick="loadConversation('${name}')" style="padding: 16px; border-bottom: 1px solid #1a1a1a; cursor: pointer; transition: background 0.15s; ${i === 0 ? 'background: #141414; border-left: 2px solid #6a4cf5;' : ''}" onmouseover="this.style.background='#141414'" onmouseout="this.style.background='${i === 0 ? '#141414' : 'transparent'}'">
-          <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
-            <div style="width: 32px; height: 32px; background: linear-gradient(135deg, hsl(${i * 40}, 70%, 60%), hsl(${i * 40 + 60}, 70%, 50%)); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">${name.slice(0,2)}</div>
-            <div style="flex: 1; min-width: 0;">
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="font-size: 13px; font-weight: ${unread ? '600' : '400'};">${name}</span>
-                <span style="font-size: 11px; color: #555;">${times[i]}</span>
-              </div>
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span style="font-size: 12px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px;">${previews[i]}</span>
-                ${unread ? '<div style="width: 8px; height: 8px; background: #6a4cf5; border-radius: 50%; flex-shrink: 0;"></div>' : ''}
-              </div>
-            </div>
-          </div>
-          <div style="display: flex; gap: 6px;">
-            <span style="font-size: 10px; background: rgba(106,76,245,0.15); color: #6a4cf5; padding: 2px 8px; border-radius: 100px;">${statuses[i]}</span>
-          </div>
-        </div>`
-      }).join('')}
+      <div id="conv-list" style="flex:1; overflow-y:auto;">
+        <div style="padding:20px; text-align:center; color:#555;"><i class="fas fa-spinner fa-spin"></i></div>
+      </div>
     </div>
     
     <!-- Chat panel -->
     <div class="card" style="display: flex; flex-direction: column; overflow: hidden;">
-      <!-- Chat header -->
-      <div style="padding: 16px 20px; border-bottom: 1px solid #1a1a1a; display: flex; align-items: center; gap: 12px;">
-        <div style="width: 36px; height: 36px; background: linear-gradient(135deg, #ff5577, #ff7a3d); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700;">SK</div>
-        <div>
-          <div style="font-size: 14px; font-weight: 600;">Sarah K.</div>
-          <div style="font-size: 12px; color: #666;">sarah.k@example.com • TKT-1042</div>
-        </div>
-        <div style="margin-left: auto; display: flex; gap: 8px; align-items: center;">
-          <span class="badge badge-urgent">Urgent</span>
-          <button class="btn-primary" style="font-size: 12px; padding: 7px 14px;"><i class="fas fa-user-check"></i> Assign to me</button>
-          <button style="background: none; border: 1px solid #262626; border-radius: 100px; color: #666; padding: 7px 12px; font-size: 12px; cursor: pointer;"><i class="fas fa-ellipsis-h"></i></button>
-        </div>
+      <!-- Empty state -->
+      <div id="chat-empty" style="flex:1; display:flex; align-items:center; justify-content:center; flex-direction:column; color:#555; gap:12px;">
+        <i class="fas fa-comments" style="font-size:48px;"></i>
+        <div style="font-size:14px;">Select a conversation to view messages</div>
       </div>
       
-      <!-- Context panel -->
-      <div style="padding: 10px 20px; background: rgba(106,76,245,0.08); border-bottom: 1px solid #1a1a1a; display: flex; align-items: center; gap: 16px;">
-        <div style="font-size: 12px; color: #999;"><i class="fas fa-robot" style="color: #6a4cf5; margin-right: 4px;"></i> AI Conversation → Human Handoff</div>
-        <div style="font-size: 12px; color: #999;"><i class="fas fa-clock" style="margin-right: 4px;"></i> SLA: <span style="color: #ff5577;">2h 14m remaining</span></div>
-        <div style="font-size: 12px; color: #999;"><i class="fas fa-layer-group" style="margin-right: 4px;"></i> KB: Product Docs</div>
-      </div>
-      
-      <!-- Messages -->
-      <div style="flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px;" id="chat-messages">
-        <!-- AI messages -->
-        <div style="display: flex; gap: 10px; align-items: flex-start;">
-          <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; flex-shrink: 0; margin-top: 2px;"><i class="fas fa-bolt" style="color: white;"></i></div>
+      <!-- Chat content (hidden until conv selected) -->
+      <div id="chat-panel" style="display:none; flex-direction:column; height:100%;">
+        <!-- Chat header -->
+        <div style="padding: 16px 20px; border-bottom: 1px solid #1a1a1a; display: flex; align-items: center; gap: 12px; flex-shrink:0;">
+          <div id="chat-avatar" style="width:36px; height:36px; background:linear-gradient(135deg, #6a4cf5, #d44df0); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; flex-shrink:0;">--</div>
           <div>
-            <div class="msg-ai">
-              <div style="font-size: 11px; color: #6a4cf5; margin-bottom: 4px; font-weight: 600;">SupportIQ AI</div>
-              <div style="font-size: 13px; line-height: 1.6; color: #ccc;">Hi Sarah! I'm the AI assistant. I can see you're having trouble with your password reset. Let me help you with that! 👋</div>
-            </div>
-            <div style="font-size: 11px; color: #555; margin-top: 4px;">2:14 PM</div>
+            <div id="chat-name" style="font-size:14px; font-weight:600;">-</div>
+            <div id="chat-meta" style="font-size:12px; color:#666;">-</div>
+          </div>
+          <div style="margin-left:auto; display:flex; gap:8px; align-items:center;">
+            <span id="chat-status-badge" class="badge badge-open">Open</span>
+            <button onclick="markResolved()" class="btn-primary" style="font-size:12px; padding:7px 14px;"><i class="fas fa-check"></i> Resolve</button>
+            <button onclick="getDraftReply()" style="background:rgba(106,76,245,0.15); border:1px solid rgba(106,76,245,0.3); border-radius:100px; color:#6a4cf5; padding:7px 14px; font-size:12px; cursor:pointer;"><i class="fas fa-robot"></i> AI Draft</button>
           </div>
         </div>
         
-        <div style="display: flex; gap: 10px; align-items: flex-start; flex-direction: row-reverse;">
-          <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #ff5577, #ff7a3d); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0; margin-top: 2px;">SK</div>
-          <div>
-            <div class="msg-customer">
-              <div style="font-size: 13px; line-height: 1.6; color: #ccc;">Hi, I requested a password reset 30 minutes ago but still haven't received the email.</div>
-            </div>
-            <div style="font-size: 11px; color: #555; margin-top: 4px; text-align: right;">2:15 PM</div>
-          </div>
+        <!-- Messages -->
+        <div id="chat-messages" style="flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:16px;">
         </div>
         
-        <div style="display: flex; gap: 10px; align-items: flex-start;">
-          <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; flex-shrink: 0; margin-top: 2px;"><i class="fas fa-bolt" style="color: white;"></i></div>
-          <div>
-            <div class="msg-ai">
-              <div style="font-size: 11px; color: #6a4cf5; margin-bottom: 4px; font-weight: 600;">SupportIQ AI</div>
-              <div style="font-size: 13px; line-height: 1.6; color: #ccc;">Password reset emails are sent within 5 minutes. Please check: (1) Your spam/junk folder, (2) That you entered the correct email address. You can also use <span style="color: #0099ff;">Magic Link login</span> as an alternative. Would you like me to resend the email?</div>
-              <div style="margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap;">
-                <span style="font-size: 10px; color: #6a4cf5; background: rgba(106,76,245,0.2); padding: 2px 8px; border-radius: 100px; border: 1px solid rgba(106,76,245,0.3); cursor: pointer;">📄 Account FAQ</span>
-                <span style="font-size: 10px; color: #666; background: rgba(255,255,255,0.05); padding: 2px 8px; border-radius: 100px;">Confidence: 89%</span>
-              </div>
+        <!-- Reply box -->
+        <div style="padding: 16px 20px; border-top: 1px solid #1a1a1a; flex-shrink:0;">
+          <div style="display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap;">
+            <button onclick="insertCanned('I apologize for the inconvenience. Let me check this for you right away.')" style="background:#1c1c1c; border:1px solid #262626; border-radius:100px; padding:4px 12px; font-size:11px; color:#999; cursor:pointer;">👋 Greeting</button>
+            <button onclick="insertCanned('I have escalated this to our technical team. You will hear back within 2 hours.')" style="background:#1c1c1c; border:1px solid #262626; border-radius:100px; padding:4px 12px; font-size:11px; color:#999; cursor:pointer;">⬆️ Escalate</button>
+            <button onclick="insertCanned('Your issue has been resolved. Please let me know if you need anything else!')" style="background:#1c1c1c; border:1px solid #262626; border-radius:100px; padding:4px 12px; font-size:11px; color:#999; cursor:pointer;">✅ Resolved</button>
+          </div>
+          <div style="display: flex; gap: 10px; align-items: flex-end;">
+            <textarea id="reply-input" placeholder="Type a reply..." style="flex:1; background:#1c1c1c; border:1px solid #262626; border-radius:10px; padding:12px 14px; color:#fff; font-size:13px; outline:none; resize:none; min-height:80px; font-family:inherit;" onfocus="this.style.borderColor='rgba(0,153,255,0.4)'" onblur="this.style.borderColor='#262626'"></textarea>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <button onclick="sendReply()" class="btn-primary" style="border-radius:8px; padding:10px 16px;"><i class="fas fa-paper-plane"></i></button>
             </div>
-            <div style="font-size: 11px; color: #555; margin-top: 4px;">2:15 PM</div>
-          </div>
-        </div>
-        
-        <div style="display: flex; gap: 10px; align-items: flex-start; flex-direction: row-reverse;">
-          <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #ff5577, #ff7a3d); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0; margin-top: 2px;">SK</div>
-          <div>
-            <div class="msg-customer">
-              <div style="font-size: 13px; line-height: 1.6; color: #ccc;">I've checked spam too. Nothing there. I need to access my account urgently. Can I speak to a human agent please?</div>
-            </div>
-            <div style="font-size: 11px; color: #555; margin-top: 4px; text-align: right;">2:22 PM</div>
-          </div>
-        </div>
-        
-        <!-- Handoff notice -->
-        <div style="display: flex; justify-content: center;">
-          <div style="background: rgba(106,76,245,0.15); border: 1px solid rgba(106,76,245,0.3); border-radius: 100px; padding: 6px 16px; font-size: 12px; color: #6a4cf5;">
-            <i class="fas fa-arrow-right" style="margin-right: 4px;"></i> Transferred to human agent
-          </div>
-        </div>
-        
-        <!-- Typing -->
-        <div style="display: flex; gap: 10px; align-items: flex-start;">
-          <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #22c55e, #0099ff); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0; margin-top: 2px;">AM</div>
-          <div>
-            <div style="background: #1c1c1c; border-radius: 12px; padding: 12px 16px; display: flex; gap: 4px; align-items: center; width: fit-content;">
-              <span class="typing-dot"></span>
-              <span class="typing-dot"></span>
-              <span class="typing-dot"></span>
-            </div>
-            <div style="font-size: 11px; color: #555; margin-top: 4px;">Alex is typing...</div>
-          </div>
-        </div>
-      </div>
-      
-      <!-- Reply box -->
-      <div style="padding: 16px 20px; border-top: 1px solid #1a1a1a;">
-        <!-- Canned responses -->
-        <div style="display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap;">
-          <button onclick="insertCanned('I apologize for the inconvenience. Let me check this for you right away.')" style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 4px 12px; font-size: 11px; color: #999; cursor: pointer;">👋 Greeting</button>
-          <button onclick="insertCanned('I have escalated this to our technical team. You will hear back within 2 hours.')" style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 4px 12px; font-size: 11px; color: #999; cursor: pointer;">⬆️ Escalate</button>
-          <button onclick="insertCanned('Your issue has been resolved. Please let me know if you need anything else!')" style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 4px 12px; font-size: 11px; color: #999; cursor: pointer;">✅ Resolved</button>
-        </div>
-        <div style="display: flex; gap: 10px; align-items: flex-end;">
-          <textarea id="reply-input" placeholder="Reply to Sarah..." style="flex: 1; background: #1c1c1c; border: 1px solid #262626; border-radius: 10px; padding: 12px 14px; color: #fff; font-size: 13px; outline: none; resize: none; min-height: 80px; font-family: inherit;" onfocus="this.style.borderColor='rgba(0,153,255,0.4)'" onblur="this.style.borderColor='#262626'"></textarea>
-          <div style="display: flex; flex-direction: column; gap: 8px;">
-            <button style="background: none; border: 1px solid #262626; border-radius: 8px; width: 36px; height: 36px; color: #666; cursor: pointer;" title="Add note"><i class="fas fa-sticky-note"></i></button>
-            <button onclick="sendReply()" class="btn-primary" style="border-radius: 8px; padding: 10px 16px; width: auto;"><i class="fas fa-paper-plane"></i></button>
           </div>
         </div>
       </div>
@@ -1620,16 +1520,172 @@ function getInboxContent(): string {
   </div>
   
   <script>
-    function setTab(btn, tab) {
-      document.querySelectorAll('.tab-btn').forEach(b => { b.style.background = 'none'; b.style.color = '#666'; });
+    let currentConvId = null;
+    let currentTabFilter = '';
+    
+    function timeAgo(d) {
+      if (!d) return '';
+      const diff = Date.now() - new Date(d).getTime();
+      const m = Math.floor(diff/60000);
+      if (m < 60) return m + 'm ago';
+      const h = Math.floor(m/60);
+      if (h < 24) return h + 'h ago';
+      return Math.floor(h/24) + 'd ago';
     }
-    function loadConversation(name) {}
-    function insertCanned(text) { document.getElementById('reply-input').value = text; }
-    function sendReply() {
+    
+    function statusColor(s) {
+      const m = { open:'#0099ff', ai_handling:'#6a4cf5', escalated:'#ff5577', resolved:'#22c55e', closed:'#555' };
+      return m[s] || '#999';
+    }
+    
+    function setConvTab(tab) {
+      ['all','escalated','resolved'].forEach(t => {
+        const btn = document.getElementById('tab-'+t);
+        btn.style.background = t === tab ? '#1c1c1c' : 'none';
+        btn.style.color = t === tab ? '#fff' : '#666';
+      });
+      currentTabFilter = tab === 'all' ? '' : tab;
+      loadConversations();
+    }
+    
+    async function loadConversations() {
+      let url = '/api/conversations?limit=50';
+      if (currentTabFilter) url += '&status=' + currentTabFilter;
+      document.getElementById('conv-list').innerHTML = '<div style="padding:20px; text-align:center; color:#555;"><i class="fas fa-spinner fa-spin"></i></div>';
+      try {
+        const data = await authFetch(url).then(r => r.json());
+        const convs = data.conversations || [];
+        document.getElementById('inbox-count').textContent = convs.length + ' conversations';
+        if (!convs.length) {
+          document.getElementById('conv-list').innerHTML = '<div style="padding:24px; text-align:center; color:#555; font-size:13px;">No conversations yet</div>';
+          return;
+        }
+        document.getElementById('conv-list').innerHTML = convs.map((c, i) => {
+          const initials = (c.customer_name||'??').slice(0,2).toUpperCase();
+          const hue = (c.customer_name||'A').charCodeAt(0) * 15 % 360;
+          return \`<div onclick="openConversation('\${c.id}')" id="conv-item-\${c.id}" style="padding:14px 16px; border-bottom:1px solid #1a1a1a; cursor:pointer; transition:background 0.15s;" onmouseover="this.style.background='#141414'" onmouseout="this.style.background='transparent'">
+            <div style="display:flex; gap:10px; align-items:flex-start;">
+              <div style="width:32px; height:32px; background:linear-gradient(135deg,hsl(\${hue},70%,55%),hsl(\${hue+60},70%,45%)); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; flex-shrink:0;">\${initials}</div>
+              <div style="flex:1; min-width:0;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                  <span style="font-size:13px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">\${c.customer_name||'Visitor'}</span>
+                  <span style="font-size:11px; color:#555; flex-shrink:0;">\${timeAgo(c.updated_at)}</span>
+                </div>
+                <div style="font-size:11px; color:#555; margin-bottom:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">\${c.customer_email||c.channel}</div>
+                <span style="font-size:10px; background:rgba(0,0,0,0.3); color:\${statusColor(c.status)}; border:1px solid \${statusColor(c.status)}33; padding:2px 8px; border-radius:100px;">\${c.status}</span>
+              </div>
+            </div>
+          </div>\`;
+        }).join('');
+      } catch(e) {
+        document.getElementById('conv-list').innerHTML = '<div style="padding:20px; color:#ff5577; font-size:13px;">Failed to load conversations</div>';
+      }
+    }
+    
+    async function openConversation(convId) {
+      currentConvId = convId;
+      // Highlight selected
+      document.querySelectorAll('[id^=conv-item-]').forEach(el => el.style.borderLeft = 'none');
+      const el = document.getElementById('conv-item-' + convId);
+      if (el) el.style.borderLeft = '2px solid #6a4cf5';
+      
+      document.getElementById('chat-empty').style.display = 'none';
+      document.getElementById('chat-panel').style.display = 'flex';
+      document.getElementById('chat-messages').innerHTML = '<div style="text-align:center; color:#555; padding:20px;"><i class="fas fa-spinner fa-spin"></i></div>';
+      
+      try {
+        const [convRes, msgRes] = await Promise.all([
+          authFetch('/api/conversations/' + convId).then(r => r.json()),
+          authFetch('/api/conversations/' + convId + '/messages').then(r => r.json()),
+        ]);
+        const conv = convRes.conversation;
+        const msgs = msgRes.messages || [];
+        
+        // Update header
+        const initials = (conv.customer_name||'??').slice(0,2).toUpperCase();
+        document.getElementById('chat-avatar').textContent = initials;
+        document.getElementById('chat-name').textContent = conv.customer_name || 'Visitor';
+        document.getElementById('chat-meta').textContent = (conv.customer_email||conv.channel||'widget') + ' • ' + conv.status;
+        
+        const statusBadgeEl = document.getElementById('chat-status-badge');
+        statusBadgeEl.textContent = conv.status;
+        statusBadgeEl.className = 'badge ' + ({open:'badge-open',escalated:'badge-urgent',resolved:'badge-resolved',ai_handling:'badge-medium'}[conv.status]||'badge-low');
+        
+        // Render messages
+        document.getElementById('chat-messages').innerHTML = msgs.length ? msgs.map(m => {
+          const isCustomer = m.sender_type === 'customer';
+          const isSystem = m.sender_type === 'system';
+          if (isSystem) return \`<div style="display:flex; justify-content:center; margin:4px 0;"><div style="background:rgba(106,76,245,0.15); border:1px solid rgba(106,76,245,0.3); border-radius:100px; padding:4px 14px; font-size:11px; color:#6a4cf5;">\${m.content}</div></div>\`;
+          const confidence = m.confidence ? \`<span style="font-size:10px; background:rgba(255,255,255,0.05); padding:2px 8px; border-radius:100px; color:#666; margin-left:4px;">Confidence: \${Math.round(m.confidence*100)}%</span>\` : '';
+          const sources = m.sources && JSON.parse(m.sources||'[]').length ? \`<div style="margin-top:6px; display:flex; gap:4px; flex-wrap:wrap;">\${JSON.parse(m.sources).map(s=>\`<span style="font-size:10px; background:rgba(106,76,245,0.2); color:#6a4cf5; padding:2px 8px; border-radius:100px; border:1px solid rgba(106,76,245,0.3);">📄 \${s}</span>\`).join('')}</div>\` : '';
+          if (isCustomer) return \`<div style="display:flex; gap:10px; flex-direction:row-reverse; align-items:flex-start;">
+            <div style="width:28px; height:28px; background:#ff5577; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; flex-shrink:0;">\${initials}</div>
+            <div><div style="background:#1c1c1c; border-radius:12px 12px 4px 12px; padding:12px 14px; max-width:80%;"><div style="font-size:13px; line-height:1.6; color:#ccc;">\${m.content}</div></div>
+            <div style="font-size:11px; color:#555; margin-top:4px; text-align:right;">\${timeAgo(m.created_at)}</div></div>
+          </div>\`;
+          return \`<div style="display:flex; gap:10px; align-items:flex-start;">
+            <div style="width:28px; height:28px; background:linear-gradient(135deg,#6a4cf5,#d44df0); border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:10px; flex-shrink:0;"><i class="fas fa-bolt" style="color:white;"></i></div>
+            <div><div style="background:rgba(106,76,245,0.12); border-radius:12px 12px 12px 4px; padding:12px 14px; max-width:80%;">
+              <div style="font-size:11px; color:#6a4cf5; margin-bottom:4px; font-weight:600;">\${m.sender_type === 'ai' ? 'SupportIQ AI' : 'Agent'} \${confidence}</div>
+              <div style="font-size:13px; line-height:1.6; color:#ccc;">\${m.content}</div>\${sources}
+            </div><div style="font-size:11px; color:#555; margin-top:4px;">\${timeAgo(m.created_at)}</div></div>
+          </div>\`;
+        }).join('') : '<div style="text-align:center; color:#555; font-size:13px; padding:20px;">No messages yet</div>';
+        
+        // Scroll to bottom
+        const msgEl = document.getElementById('chat-messages');
+        msgEl.scrollTop = msgEl.scrollHeight;
+      } catch(e) {
+        document.getElementById('chat-messages').innerHTML = '<div style="color:#ff5577; padding:20px;">Failed to load messages</div>';
+      }
+    }
+    
+    async function sendReply() {
+      if (!currentConvId) return;
       const input = document.getElementById('reply-input');
-      if (!input.value.trim()) return;
+      const content = input.value.trim();
+      if (!content) return;
       input.value = '';
+      try {
+        await authFetch('/api/conversations/' + currentConvId + '/messages', {
+          method:'POST',
+          body: JSON.stringify({ content, sender_type: 'agent' })
+        });
+        openConversation(currentConvId);
+      } catch(e) { input.value = content; }
     }
+    
+    async function markResolved() {
+      if (!currentConvId) return;
+      try {
+        await authFetch('/api/conversations/' + currentConvId + '/status', {
+          method:'PATCH',
+          body: JSON.stringify({ status: 'resolved' })
+        });
+        loadConversations();
+        openConversation(currentConvId);
+      } catch(e) {}
+    }
+    
+    async function getDraftReply() {
+      if (!currentConvId) return;
+      const btn = event.target.closest('button');
+      btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+      try {
+        const data = await authFetch('/api/chat/agent', {
+          method:'POST',
+          body: JSON.stringify({ conversation_id: currentConvId })
+        }).then(r => r.json());
+        if (data.draft) {
+          document.getElementById('reply-input').value = data.draft;
+        }
+      } catch(e) {}
+      btn.innerHTML = '<i class="fas fa-robot"></i> AI Draft';
+    }
+    
+    function insertCanned(text) { document.getElementById('reply-input').value = text; }
+    
+    loadConversations();
   </script>`
 }
 
@@ -1638,58 +1694,241 @@ function getTicketsContent(): string {
   <div style="margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
     <div>
       <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Tickets</h1>
-      <p style="font-size: 14px; color: #666;">47 open tickets</p>
+      <p style="font-size: 14px; color: #666;" id="ticket-count">Loading tickets...</p>
     </div>
     <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-      <select style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 8px 16px; color: #999; font-size: 13px; outline: none; cursor: pointer; font-family: inherit;">
-        <option>All Status</option>
-        <option>Open</option>
-        <option>In Progress</option>
-        <option>Resolved</option>
+      <select id="status-filter" onchange="loadTickets()" style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 8px 16px; color: #999; font-size: 13px; outline: none; cursor: pointer; font-family: inherit;">
+        <option value="">All Status</option>
+        <option value="open">Open</option>
+        <option value="in_progress">In Progress</option>
+        <option value="resolved">Resolved</option>
+        <option value="closed">Closed</option>
       </select>
-      <select style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 8px 16px; color: #999; font-size: 13px; outline: none; cursor: pointer; font-family: inherit;">
-        <option>All Priority</option>
-        <option>Urgent</option>
-        <option>High</option>
-        <option>Medium</option>
-        <option>Low</option>
+      <select id="priority-filter" onchange="loadTickets()" style="background: #1c1c1c; border: 1px solid #262626; border-radius: 100px; padding: 8px 16px; color: #999; font-size: 13px; outline: none; cursor: pointer; font-family: inherit;">
+        <option value="">All Priority</option>
+        <option value="urgent">Urgent</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low</option>
       </select>
-      <button class="btn-primary"><i class="fas fa-plus"></i> New Ticket</button>
+      <button class="btn-primary" onclick="showNewTicketModal()"><i class="fas fa-plus"></i> New Ticket</button>
+    </div>
+  </div>
+
+  <!-- New Ticket Modal -->
+  <div id="new-ticket-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center;">
+    <div style="background:#141414; border:1px solid #262626; border-radius:20px; width:520px; max-width:90vw; padding:28px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:24px;">
+        <h2 style="font-size:18px; font-weight:600;">Create New Ticket</h2>
+        <button onclick="hideNewTicketModal()" style="background:none; border:none; color:#666; font-size:18px; cursor:pointer;">×</button>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:16px;">
+        <div>
+          <label style="font-size:13px; color:#999; margin-bottom:6px; display:block;">Subject *</label>
+          <input id="nt-subject" type="text" placeholder="Brief description of the issue" style="width:100%; background:#1c1c1c; border:1px solid #262626; border-radius:8px; padding:10px 14px; color:#fff; font-size:13px; outline:none; font-family:inherit;">
+        </div>
+        <div>
+          <label style="font-size:13px; color:#999; margin-bottom:6px; display:block;">Description</label>
+          <textarea id="nt-description" placeholder="Detailed description..." style="width:100%; background:#1c1c1c; border:1px solid #262626; border-radius:8px; padding:10px 14px; color:#fff; font-size:13px; outline:none; font-family:inherit; resize:vertical; min-height:80px;"></textarea>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div>
+            <label style="font-size:13px; color:#999; margin-bottom:6px; display:block;">Priority</label>
+            <select id="nt-priority" style="width:100%; background:#1c1c1c; border:1px solid #262626; border-radius:8px; padding:10px 14px; color:#fff; font-size:13px; outline:none; font-family:inherit;">
+              <option value="medium">Medium</option>
+              <option value="urgent">Urgent</option>
+              <option value="high">High</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:13px; color:#999; margin-bottom:6px; display:block;">Customer Name</label>
+            <input id="nt-customer" type="text" placeholder="Customer name" style="width:100%; background:#1c1c1c; border:1px solid #262626; border-radius:8px; padding:10px 14px; color:#fff; font-size:13px; outline:none; font-family:inherit;">
+          </div>
+        </div>
+        <div>
+          <label style="font-size:13px; color:#999; margin-bottom:6px; display:block;">Customer Email</label>
+          <input id="nt-email" type="email" placeholder="customer@example.com" style="width:100%; background:#1c1c1c; border:1px solid #262626; border-radius:8px; padding:10px 14px; color:#fff; font-size:13px; outline:none; font-family:inherit;">
+        </div>
+      </div>
+      <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:24px;">
+        <button onclick="hideNewTicketModal()" class="btn-secondary">Cancel</button>
+        <button onclick="submitNewTicket()" class="btn-primary" id="submit-ticket-btn"><i class="fas fa-plus"></i> Create Ticket</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Ticket Detail Modal -->
+  <div id="ticket-detail-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center;">
+    <div style="background:#141414; border:1px solid #262626; border-radius:20px; width:640px; max-width:95vw; max-height:85vh; overflow-y:auto; padding:28px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
+        <h2 style="font-size:18px; font-weight:600;" id="td-subject">Ticket Detail</h2>
+        <button onclick="hideTicketDetail()" style="background:none; border:none; color:#666; font-size:18px; cursor:pointer;">×</button>
+      </div>
+      <div id="td-content" style="font-size:13px; color:#ccc; line-height:1.8;"></div>
+      <div style="margin-top:24px;">
+        <h3 style="font-size:14px; font-weight:600; margin-bottom:12px;">Add Comment</h3>
+        <textarea id="td-comment" placeholder="Add a comment or internal note..." style="width:100%; background:#1c1c1c; border:1px solid #262626; border-radius:8px; padding:10px 14px; color:#fff; font-size:13px; outline:none; font-family:inherit; resize:vertical; min-height:80px;"></textarea>
+        <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:12px;">
+          <button onclick="hideTicketDetail()" class="btn-secondary">Close</button>
+          <button onclick="submitComment()" class="btn-primary"><i class="fas fa-paper-plane"></i> Comment</button>
+        </div>
+      </div>
     </div>
   </div>
   
-  <div class="card">
+  <div class="card" id="tickets-table">
     <!-- Table header -->
-    <div style="display: grid; grid-template-columns: 100px 1fr 120px 100px 120px 140px 80px; gap: 12px; padding: 12px 20px; border-bottom: 1px solid #1a1a1a; font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.5px;">
+    <div style="display: grid; grid-template-columns: 110px 1fr 130px 100px 120px 80px; gap: 12px; padding: 12px 20px; border-bottom: 1px solid #1a1a1a; font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.5px;">
       <div>ID</div>
       <div>Subject</div>
       <div>Customer</div>
       <div>Priority</div>
       <div>Status</div>
-      <div>Assignee</div>
       <div>Created</div>
     </div>
+    <div id="tickets-body">
+      <div style="padding: 40px; text-align: center; color: #555;">
+        <i class="fas fa-spinner fa-spin" style="font-size: 24px; margin-bottom: 12px;"></i>
+        <div>Loading tickets...</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentTicketId = null;
     
-    ${[
-      { id: 'TKT-1042', subject: 'Unable to reset password', customer: 'Sarah K.', priority: 'urgent', status: 'open', assignee: 'Alex M.', created: '2h ago' },
-      { id: 'TKT-1041', subject: 'Billing charge discrepancy', customer: 'James R.', priority: 'high', status: 'in_progress', assignee: 'Maria L.', created: '3h ago' },
-      { id: 'TKT-1040', subject: 'API integration 401 error', customer: 'Dev Corp', priority: 'medium', status: 'open', assignee: null, created: '5h ago' },
-      { id: 'TKT-1039', subject: 'Feature request: dark mode', customer: 'Emily T.', priority: 'low', status: 'resolved', assignee: 'Alex M.', created: '1d ago' },
-      { id: 'TKT-1038', subject: 'Export data to CSV', customer: 'TechStart', priority: 'medium', status: 'in_progress', assignee: 'Jordan B.', created: '1d ago' },
-      { id: 'TKT-1037', subject: 'SSO configuration help', customer: 'Enterprise Co', priority: 'high', status: 'open', assignee: null, created: '2d ago' },
-      { id: 'TKT-1036', subject: 'Mobile app crashes on login', customer: 'Mike Chen', priority: 'urgent', status: 'in_progress', assignee: 'Maria L.', created: '2d ago' },
-      { id: 'TKT-1035', subject: 'Webhook not firing', customer: 'Webhook Inc', priority: 'medium', status: 'resolved', assignee: 'Jordan B.', created: '3d ago' },
-    ].map(t => `
-    <div style="display: grid; grid-template-columns: 100px 1fr 120px 100px 120px 140px 80px; gap: 12px; padding: 14px 20px; border-bottom: 1px solid #1a1a1a; cursor: pointer; transition: background 0.15s; align-items: center; font-size: 13px;" onmouseover="this.style.background='#141414'" onmouseout="this.style.background='transparent'" onclick="window.location.href='/dashboard/inbox'">
-      <div style="font-family: monospace; color: #666; font-size: 12px;">${t.id}</div>
-      <div style="font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${t.subject}</div>
-      <div style="color: #999; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${t.customer}</div>
-      <div><span class="badge badge-${t.priority}">${t.priority.charAt(0).toUpperCase() + t.priority.slice(1)}</span></div>
-      <div><span class="badge badge-${t.status === 'in_progress' ? 'progress' : t.status}">${t.status === 'in_progress' ? 'In Progress' : t.status.charAt(0).toUpperCase() + t.status.slice(1)}</span></div>
-      <div style="color: #999; font-size: 12px;">${t.assignee || '<span style="color: #555;">Unassigned</span>'}</div>
-      <div style="color: #555; font-size: 12px;">${t.created}</div>
-    </div>`).join('')}
-  </div>`
+    function timeAgo(dateStr) {
+      const d = new Date(dateStr);
+      const diff = Date.now() - d.getTime();
+      const m = Math.floor(diff / 60000);
+      if (m < 60) return m + 'm ago';
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + 'h ago';
+      return Math.floor(h/24) + 'd ago';
+    }
+    
+    function priorityBadge(p) {
+      const map = { urgent:'badge-urgent', high:'badge-high', medium:'badge-medium', low:'badge-low' };
+      return '<span class="badge ' + (map[p]||'badge-low') + '">' + (p||'').charAt(0).toUpperCase()+(p||'').slice(1) + '</span>';
+    }
+    
+    function statusBadge(s) {
+      const map = { open:'badge-open', in_progress:'badge-progress', resolved:'badge-resolved', closed:'badge-low' };
+      const labels = { open:'Open', in_progress:'In Progress', resolved:'Resolved', closed:'Closed' };
+      return '<span class="badge ' + (map[s]||'badge-low') + '">' + (labels[s]||s) + '</span>';
+    }
+    
+    async function loadTickets() {
+      const status = document.getElementById('status-filter').value;
+      const priority = document.getElementById('priority-filter').value;
+      let url = '/api/tickets?limit=50';
+      if (status) url += '&status=' + status;
+      if (priority) url += '&priority=' + priority;
+      
+      try {
+        const data = await authFetch(url).then(r => r.json());
+        const tickets = data.tickets || [];
+        document.getElementById('ticket-count').textContent = tickets.length + ' tickets';
+        
+        if (!tickets.length) {
+          document.getElementById('tickets-body').innerHTML = '<div style="padding:40px; text-align:center; color:#555;"><i class="fas fa-ticket" style="font-size:32px; margin-bottom:12px; display:block;"></i>No tickets found. Create your first one!</div>';
+          return;
+        }
+        
+        document.getElementById('tickets-body').innerHTML = tickets.map(t => \`
+        <div onclick="openTicketDetail('\${t.id}')" style="display:grid; grid-template-columns:110px 1fr 130px 100px 120px 80px; gap:12px; padding:14px 20px; border-bottom:1px solid #1a1a1a; cursor:pointer; transition:background 0.15s; align-items:center; font-size:13px;" onmouseover="this.style.background='#141414'" onmouseout="this.style.background='transparent'">
+          <div style="font-family:monospace; color:#666; font-size:12px;">\${t.id.slice(-8).toUpperCase()}</div>
+          <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">\${t.subject}</div>
+          <div style="color:#999; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">\${t.customer_name||t.customer_email||'Unknown'}</div>
+          <div>\${priorityBadge(t.priority)}</div>
+          <div>\${statusBadge(t.status)}</div>
+          <div style="color:#555; font-size:12px;">\${timeAgo(t.created_at)}</div>
+        </div>\`).join('');
+      } catch(e) {
+        document.getElementById('tickets-body').innerHTML = '<div style="padding:40px; text-align:center; color:#ff5577;"><i class="fas fa-exclamation-circle" style="font-size:24px; margin-bottom:8px; display:block;"></i>Failed to load tickets.</div>';
+      }
+    }
+    
+    async function openTicketDetail(ticketId) {
+      currentTicketId = ticketId;
+      document.getElementById('ticket-detail-modal').style.display = 'flex';
+      document.getElementById('td-content').innerHTML = '<div style="text-align:center; padding:20px; color:#555;"><i class="fas fa-spinner fa-spin"></i> Loading...</div>';
+      try {
+        const [ticketRes, commentsRes] = await Promise.all([
+          authFetch('/api/tickets/' + ticketId).then(r => r.json()),
+          authFetch('/api/tickets/' + ticketId + '/comments').then(r => r.json()),
+        ]);
+        const t = ticketRes.ticket;
+        const comments = commentsRes.comments || [];
+        document.getElementById('td-subject').textContent = t.subject;
+        document.getElementById('td-content').innerHTML = \`
+          <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px;">
+            \${priorityBadge(t.priority)} \${statusBadge(t.status)}
+            <span style="font-size:12px; color:#666;">\${t.customer_name||''} \${t.customer_email ? '('+t.customer_email+')' : ''}</span>
+          </div>
+          <div style="margin-bottom:16px; color:#aaa;">\${t.description || 'No description provided.'}</div>
+          <div style="border-top:1px solid #1a1a1a; padding-top:16px;">
+            <div style="font-size:12px; color:#555; margin-bottom:12px;">SLA Due: \${t.sla_due_at ? new Date(t.sla_due_at).toLocaleString() : 'N/A'}</div>
+            \${comments.length ? '<div style="font-weight:600; font-size:13px; margin-bottom:10px;">Comments (' + comments.length + ')</div>' + comments.map(c => \`<div style="background:#1c1c1c; border-radius:8px; padding:12px; margin-bottom:8px;"><div style="font-size:11px; color:#555; margin-bottom:4px;">\${timeAgo(c.created_at)}</div><div style="font-size:13px; color:#ccc;">\${c.content}</div></div>\`).join('') : '<div style="color:#555; font-size:13px;">No comments yet.</div>'}
+          </div>\`
+        ;
+      } catch(e) {
+        document.getElementById('td-content').innerHTML = '<div style="color:#ff5577;">Failed to load ticket detail.</div>';
+      }
+    }
+    
+    function hideTicketDetail() {
+      document.getElementById('ticket-detail-modal').style.display = 'none';
+      currentTicketId = null;
+    }
+    
+    async function submitComment() {
+      if (!currentTicketId) return;
+      const content = document.getElementById('td-comment').value.trim();
+      if (!content) return;
+      await authFetch('/api/tickets/' + currentTicketId + '/comments', {
+        method:'POST', body: JSON.stringify({ content, is_internal: false })
+      });
+      document.getElementById('td-comment').value = '';
+      openTicketDetail(currentTicketId);
+    }
+    
+    function showNewTicketModal() {
+      document.getElementById('new-ticket-modal').style.display = 'flex';
+    }
+    function hideNewTicketModal() {
+      document.getElementById('new-ticket-modal').style.display = 'none';
+    }
+    
+    async function submitNewTicket() {
+      const subject = document.getElementById('nt-subject').value.trim();
+      if (!subject) return alert('Subject is required');
+      const btn = document.getElementById('submit-ticket-btn');
+      btn.disabled = true; btn.textContent = 'Creating...';
+      try {
+        await authFetch('/api/tickets', {
+          method:'POST',
+          body: JSON.stringify({
+            subject,
+            description: document.getElementById('nt-description').value,
+            priority: document.getElementById('nt-priority').value,
+            customer_name: document.getElementById('nt-customer').value,
+            customer_email: document.getElementById('nt-email').value,
+            channel: 'manual',
+          })
+        });
+        hideNewTicketModal();
+        loadTickets();
+      } catch(e) {
+        alert('Failed to create ticket');
+      } finally {
+        btn.disabled = false; btn.innerHTML = '<i class="fas fa-plus"></i> Create Ticket';
+      }
+    }
+    
+    loadTickets();
+  </script>`
 }
 
 function getKnowledgeBaseContent(): string {
@@ -1848,216 +2087,875 @@ function getKnowledgeBaseContent(): string {
 
 function getAnalyticsContent(): string {
   return `
-  <div style="margin-bottom: 28px;">
-    <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Analytics</h1>
-    <p style="font-size: 14px; color: #666;">AI performance and support metrics</p>
+  <div style="margin-bottom: 28px; display:flex; justify-content:space-between; align-items:center;">
+    <div>
+      <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Analytics</h1>
+      <p style="font-size: 14px; color: #666;" id="analytics-range">AI performance and support metrics — last 30 days</p>
+    </div>
+    <button class="btn-secondary" onclick="refreshAnalytics()"><i class="fas fa-sync"></i> Refresh</button>
   </div>
   
-  <!-- Top metrics -->
-  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px;">
-    ${[
-      { icon: 'robot', color: '#22c55e', bg: 'rgba(34,197,94,0.15)', label: 'AI Resolution Rate', value: '78.4%', delta: '+4.2%' },
-      { icon: 'clock', color: '#0099ff', bg: 'rgba(0,153,255,0.15)', label: 'Avg First Response', value: '1.2s', delta: '-67%' },
-      { icon: 'star', color: '#ff7a3d', bg: 'rgba(255,122,61,0.15)', label: 'CSAT Score', value: '4.7/5', delta: '+0.3' },
-      { icon: 'exclamation-triangle', color: '#ff5577', bg: 'rgba(255,85,119,0.15)', label: 'Escalation Rate', value: '21.6%', delta: '-2.1%' },
-    ].map(m => `
-    <div class="card stat-card">
-      <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
-        <div style="width: 36px; height: 36px; background: ${m.bg}; border-radius: 10px; display: flex; align-items: center; justify-content: center;">
-          <i class="fas fa-${m.icon}" style="color: ${m.color}; font-size: 14px;"></i>
-        </div>
-        <span style="font-size: 12px; color: #22c55e;">${m.delta}</span>
-      </div>
-      <div style="font-size: 26px; font-weight: 700; letter-spacing: -1px;">${m.value}</div>
-      <div style="font-size: 13px; color: #666; margin-top: 2px;">${m.label}</div>
-    </div>`).join('')}
+  <!-- Top metrics (from API) -->
+  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px;" id="analytics-stats">
+    <div class="card stat-card" style="display:flex; align-items:center; justify-content:center; min-height:100px;"><i class="fas fa-spinner fa-spin" style="color:#555;"></i></div>
+    <div class="card stat-card" style="display:flex; align-items:center; justify-content:center; min-height:100px;"><i class="fas fa-spinner fa-spin" style="color:#555;"></i></div>
+    <div class="card stat-card" style="display:flex; align-items:center; justify-content:center; min-height:100px;"><i class="fas fa-spinner fa-spin" style="color:#555;"></i></div>
+    <div class="card stat-card" style="display:flex; align-items:center; justify-content:center; min-height:100px;"><i class="fas fa-spinner fa-spin" style="color:#555;"></i></div>
   </div>
   
   <!-- Charts -->
   <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 24px;">
     <div class="card" style="padding: 24px;">
-      <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 20px;">Ticket Volume & AI Resolution</h2>
+      <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 20px;">Ticket Volume & AI Resolutions</h2>
       <div style="height: 220px;"><canvas id="volumeChart"></canvas></div>
     </div>
     <div class="card" style="padding: 24px;">
       <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 20px;">Resolution Breakdown</h2>
       <div style="height: 160px; margin-bottom: 12px;"><canvas id="aiChart"></canvas></div>
+      <div id="resolution-details" style="display:flex; flex-direction:column; gap:6px; font-size:12px; color:#666;"></div>
     </div>
   </div>
   
-  <!-- AI Gap Analysis -->
+  <!-- Priority breakdown -->
   <div class="card" style="padding: 24px; margin-bottom: 24px;">
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-      <div>
-        <h2 style="font-size: 15px; font-weight: 600;">Knowledge Gap Analysis</h2>
-        <p style="font-size: 13px; color: #666; margin-top: 2px;">Queries AI couldn't answer — add to knowledge base</p>
-      </div>
-      <button class="btn-secondary" style="font-size: 12px;"><i class="fas fa-download"></i> Export</button>
+    <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 16px;">Ticket Priority Distribution</h2>
+    <div id="priority-bars" style="display:flex; flex-direction:column; gap:12px;">
+      <div style="color:#555; font-size:13px;">Loading...</div>
     </div>
-    
-    ${[
-      { query: 'How do I integrate with Salesforce CRM?', count: 23, action: 'Add to KB' },
-      { query: 'What is the data retention policy?', count: 18, action: 'Add to KB' },
-      { query: 'Can I get a refund after 30 days?', count: 14, action: 'Add to KB' },
-      { query: 'How to set up SSO with Okta?', count: 11, action: 'Add to KB' },
-      { query: 'Is there an offline mode available?', count: 8, action: 'Add to KB' },
-    ].map(gap => `
-    <div style="display: flex; align-items: center; gap: 16px; padding: 12px 0; border-bottom: 1px solid #1a1a1a;">
-      <div style="width: 8px; height: 8px; background: #ff7a3d; border-radius: 50%; flex-shrink: 0;"></div>
-      <div style="flex: 1; font-size: 13px; color: #ccc;">"${gap.query}"</div>
-      <div style="font-size: 12px; color: #666; min-width: 60px; text-align: right;">${gap.count} times</div>
-      <button style="background: rgba(106,76,245,0.15); color: #6a4cf5; border: 1px solid rgba(106,76,245,0.3); border-radius: 100px; padding: 4px 12px; font-size: 12px; cursor: pointer; white-space: nowrap;">${gap.action}</button>
-    </div>`).join('')}
   </div>
   
-  <!-- Agent performance -->
+  <!-- Team performance from real data -->
   <div class="card" style="padding: 24px;">
-    <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 20px;">Agent Performance</h2>
-    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;">
-      ${[
-        { name: 'Alex Morgan', tickets: 48, rating: 4.9, time: '1m 45s', color: '#6a4cf5' },
-        { name: 'Maria Lopez', tickets: 61, rating: 4.7, time: '2m 12s', color: '#d44df0' },
-        { name: 'Jordan B.', tickets: 35, rating: 4.6, time: '2m 58s', color: '#0099ff' },
-      ].map(a => `
-      <div style="background: #1c1c1c; border-radius: 12px; padding: 16px;">
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 14px;">
-          <div style="width: 36px; height: 36px; background: ${a.color}33; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: ${a.color};">${a.name.split(' ').map(n => n[0]).join('')}</div>
-          <div>
-            <div style="font-size: 13px; font-weight: 500;">${a.name}</div>
-            <div style="font-size: 11px; color: #666;">Support Agent</div>
+    <h2 style="font-size: 15px; font-weight: 600; margin-bottom: 16px;">Team Members</h2>
+    <div id="team-list">
+      <div style="color:#555; font-size:13px; padding:8px;">Loading team data...</div>
+    </div>
+  </div>
+  
+  <script>
+    function statCard(icon, color, bg, label, value, subtext) {
+      return \`<div class="card stat-card">
+        <div style="display:flex; justify-content:space-between; margin-bottom:12px;">
+          <div style="width:36px; height:36px; background:\${bg}; border-radius:10px; display:flex; align-items:center; justify-content:center;">
+            <i class="fas fa-\${icon}" style="color:\${color}; font-size:14px;"></i>
           </div>
         </div>
-        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center;">
-          <div><div style="font-size: 16px; font-weight: 700;">${a.tickets}</div><div style="font-size: 10px; color: #555;">Tickets</div></div>
-          <div><div style="font-size: 16px; font-weight: 700;">${a.rating}★</div><div style="font-size: 10px; color: #555;">CSAT</div></div>
-          <div><div style="font-size: 16px; font-weight: 700;">${a.time}</div><div style="font-size: 10px; color: #555;">Avg</div></div>
-        </div>
-      </div>`).join('')}
-    </div>
-  </div>`
+        <div style="font-size:26px; font-weight:700; letter-spacing:-1px;">\${value}</div>
+        <div style="font-size:13px; color:#666; margin-top:2px;">\${label}</div>
+        \${subtext ? \`<div style="font-size:11px; color:#555; margin-top:6px;">\${subtext}</div>\` : ''}
+      </div>\`;
+    }
+    
+    async function refreshAnalytics() {
+      // Load stats
+      const [statsData, aiData] = await Promise.all([
+        authFetch('/api/stats').then(r => r.json()).catch(() => ({})),
+        authFetch('/api/stats/ai').then(r => r.json()).catch(() => ({})),
+      ]);
+      
+      const t = statsData.tickets || {};
+      const bd = statsData.resolutionBreakdown || {};
+      const aiRate = t.total > 0 ? Math.round((bd.resolved||0)/Math.max(t.total,1)*100) : 0;
+      
+      document.getElementById('analytics-stats').innerHTML =
+        statCard('robot', '#22c55e', 'rgba(34,197,94,0.15)', 'AI Resolution Rate', aiRate + '%', \`\${bd.resolved||0} resolved / \${bd.escalated||0} escalated\`) +
+        statCard('clock', '#0099ff', 'rgba(0,153,255,0.15)', 'Avg Response Time', statsData.avgResponseTime || 'N/A', 'last 30 days') +
+        statCard('exclamation-triangle', '#ff5577', 'rgba(255,85,119,0.15)', 'Escalation Rate', (aiData.escalation_rate||0) + '%', \`\${aiData.total_ai_messages||0} AI messages\`) +
+        statCard('ticket', '#6a4cf5', 'rgba(106,76,245,0.15)', 'Total Tickets', (t.total||0).toLocaleString(), \`Open: \${t.open||0} · In Progress: \${t.in_progress||0}\`);
+      
+      // Resolution details
+      const total = (bd.resolved||0) + (bd.escalated||0) + (bd.pending||0);
+      document.getElementById('resolution-details').innerHTML = [
+        ['Resolved', bd.resolved||0, '#22c55e'],
+        ['Escalated', bd.escalated||0, '#ff5577'],
+        ['Pending', bd.pending||0, '#6a4cf5'],
+      ].map(([label, count, color]) => \`
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <div style="width:8px; height:8px; background:\${color}; border-radius:50%;"></div>
+            <span>\${label}</span>
+          </div>
+          <span style="font-weight:500; color:\${color};">\${count} (\${total ? Math.round(count/total*100) : 0}%)</span>
+        </div>\`).join('');
+      
+      // Priority bars
+      const pmap = statsData.priorityBreakdown || {};
+      const maxP = Math.max(...Object.values(pmap).map(Number), 1);
+      const priorities = [['urgent','#ff5577'],['high','#ff7a3d'],['medium','#6a4cf5'],['low','#555']];
+      document.getElementById('priority-bars').innerHTML = priorities.map(([p, color]) => {
+        const count = pmap[p] || 0;
+        const pct = Math.round((count / maxP) * 100);
+        return \`<div>
+          <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-size:12px; color:#666;">
+            <span>\${p.charAt(0).toUpperCase()+p.slice(1)}</span>
+            <span>\${count} tickets</span>
+          </div>
+          <div style="background:#1a1a1a; border-radius:4px; height:6px;">
+            <div style="width:\${pct}%; height:100%; background:\${color}; border-radius:4px; transition:width 0.5s;"></div>
+          </div>
+        </div>\`;
+      }).join('');
+      
+      // Team from settings
+      authFetch('/api/settings/team').then(r => r.json()).then(d => {
+        const team = d.team || [];
+        if (!team.length) {
+          document.getElementById('team-list').innerHTML = '<div style="color:#555; font-size:13px;">No team members yet.</div>';
+          return;
+        }
+        const colors = ['#6a4cf5','#d44df0','#0099ff','#22c55e','#ff7a3d'];
+        document.getElementById('team-list').innerHTML = \`<div style="display:grid; grid-template-columns:repeat(3,1fr); gap:12px;">\` +
+          team.map((u, i) => {
+            const initials = ((u.first_name||'')[0]||'') + ((u.last_name||'')[0]||'');
+            const color = colors[i % colors.length];
+            return \`<div style="background:#1c1c1c; border-radius:12px; padding:16px;">
+              <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+                <div style="width:36px; height:36px; background:\${color}22; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:700; color:\${color};">\${initials.toUpperCase()||'?'}</div>
+                <div>
+                  <div style="font-size:13px; font-weight:500;">\${u.first_name} \${u.last_name}</div>
+                  <div style="font-size:11px; color:#666;">\${u.role} · \${u.email}</div>
+                </div>
+              </div>
+              <span style="font-size:10px; background:\${color}22; color:\${color}; padding:2px 8px; border-radius:100px;">\${u.is_active ? 'Active' : 'Inactive'}</span>
+            </div>\`;
+          }).join('') + '</div>';
+      }).catch(() => {});
+    }
+    
+    refreshAnalytics();
+  </script>`
 }
 
 function getSettingsContent(): string {
+  const navSections = [
+    { id: 'workspace', icon: 'building', label: 'Workspace' },
+    { id: 'ai', icon: 'robot', label: 'AI Settings' },
+    { id: 'widget', icon: 'palette', label: 'Widget Design' },
+    { id: 'notifications', icon: 'bell', label: 'Notifications' },
+    { id: 'team', icon: 'users', label: 'Team & Roles' },
+    { id: 'billing', icon: 'credit-card', label: 'Billing' },
+    { id: 'integrations', icon: 'plug', label: 'Integrations' },
+    { id: 'apikeys', icon: 'key', label: 'API Keys' },
+  ]
+
   return `
   <div style="margin-bottom: 28px;">
     <h1 style="font-size: 22px; font-weight: 600; letter-spacing: -0.5px; margin-bottom: 4px;">Settings</h1>
     <p style="font-size: 14px; color: #666;">Manage your workspace and AI configuration</p>
   </div>
-  
-  <div style="display: grid; grid-template-columns: 200px 1fr; gap: 24px;">
+
+  <div style="display: grid; grid-template-columns: 200px 1fr; gap: 24px; align-items: start;">
     <!-- Settings nav -->
-    <div>
-      ${[
-        { icon: 'building', label: 'Workspace', active: true },
-        { icon: 'robot', label: 'AI Settings', active: false },
-        { icon: 'palette', label: 'Widget Design', active: false },
-        { icon: 'users', label: 'Team & Roles', active: false },
-        { icon: 'bell', label: 'Notifications', active: false },
-        { icon: 'credit-card', label: 'Billing', active: false },
-        { icon: 'plug', label: 'Integrations', active: false },
-        { icon: 'key', label: 'API Keys', active: false },
-      ].map(s => `
-      <div style="display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 2px; background: ${s.active ? '#141414' : 'transparent'}; color: ${s.active ? '#fff' : '#666'}; font-size: 13px; transition: all 0.15s;" onmouseover="this.style.background='#141414'; this.style.color='#fff'" onmouseout="this.style.background='${s.active ? '#141414' : 'transparent'}'; this.style.color='${s.active ? '#fff' : '#666'}'">
-        <i class="fas fa-${s.icon}" style="width: 16px; text-align: center;"></i> ${s.label}
+    <div style="position: sticky; top: 24px;">
+      ${navSections.map(s => `
+      <div id="nav-${s.id}" class="settings-nav-item" data-section="${s.id}"
+        style="display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;cursor:pointer;margin-bottom:2px;font-size:13px;transition:all 0.15s;"
+        onclick="showSection('${s.id}')">
+        <i class="fas fa-${s.icon}" style="width:16px;text-align:center;"></i> ${s.label}
       </div>`).join('')}
     </div>
-    
-    <!-- Settings content -->
-    <div style="display: flex; flex-direction: column; gap: 16px;">
-      <!-- Workspace -->
-      <div class="card" style="padding: 24px;">
-        <h2 style="font-size: 16px; font-weight: 600; margin-bottom: 20px;">Workspace Settings</h2>
-        <div style="display: flex; flex-direction: column; gap: 16px;">
-          <div>
-            <label style="display: block; font-size: 13px; color: #999; margin-bottom: 6px;">Workspace Name</label>
-            <input class="input-field" value="Acme Corp" style="width: 100%; max-width: 400px;">
-          </div>
-          <div>
-            <label style="display: block; font-size: 13px; color: #999; margin-bottom: 6px;">Subdomain</label>
-            <div style="display: flex; align-items: center; gap: 0; max-width: 400px;">
-              <input class="input-field" value="acme" style="flex: 1; border-radius: 8px 0 0 8px;">
-              <div style="background: #1c1c1c; border: 1px solid #262626; border-left: none; border-radius: 0 8px 8px 0; padding: 9px 14px; color: #555; font-size: 13px; white-space: nowrap;">.supportiq.io</div>
-            </div>
-          </div>
-          <div>
-            <label style="display: block; font-size: 13px; color: #999; margin-bottom: 6px;">Timezone</label>
-            <select class="input-field" style="max-width: 400px; cursor: pointer;">
-              <option>UTC-5 Eastern Time</option>
-              <option>UTC-8 Pacific Time</option>
-              <option>UTC+0 GMT</option>
-              <option>UTC+1 CET</option>
-            </select>
-          </div>
-          <button class="btn-primary" style="width: fit-content;">Save Changes</button>
-        </div>
-      </div>
-      
-      <!-- AI Settings -->
-      <div class="card" style="padding: 24px;">
-        <h2 style="font-size: 16px; font-weight: 600; margin-bottom: 4px;">AI Configuration</h2>
-        <p style="font-size: 13px; color: #666; margin-bottom: 20px;">Configure how the AI assistant responds to customers</p>
-        <div style="display: flex; flex-direction: column; gap: 16px;">
-          <div>
-            <label style="display: block; font-size: 13px; color: #999; margin-bottom: 6px;">Confidence Threshold for Escalation</label>
-            <div style="display: flex; align-items: center; gap: 12px;">
-              <input type="range" min="0" max="100" value="70" style="flex: 1; max-width: 300px; accent-color: #6a4cf5;" id="threshold-slider" oninput="document.getElementById('threshold-val').textContent = this.value + '%'">
-              <span style="font-size: 14px; font-weight: 600; min-width: 40px;" id="threshold-val">70%</span>
-            </div>
-            <div style="font-size: 12px; color: #555; margin-top: 4px;">AI will escalate to human when confidence is below this threshold</div>
-          </div>
-          
-          <div>
-            <label style="display: block; font-size: 13px; color: #999; margin-bottom: 6px;">Escalation Keywords</label>
-            <input class="input-field" value="refund, cancel, angry, lawsuit, urgent" style="width: 100%; max-width: 400px;">
-            <div style="font-size: 12px; color: #555; margin-top: 4px;">Comma-separated keywords that trigger immediate escalation</div>
-          </div>
-          
-          <div>
-            <label style="display: block; font-size: 13px; color: #999; margin-bottom: 6px;">AI Welcome Message</label>
-            <textarea class="input-field" style="width: 100%; max-width: 500px; resize: vertical; min-height: 80px;">Hi! I'm the AI support assistant for Acme Corp. How can I help you today? I can answer questions about our products, billing, and technical issues.</textarea>
-          </div>
-          
-          <div style="display: flex; align-items: center; justify-content: space-between; max-width: 400px; padding: 14px; background: #1c1c1c; border-radius: 10px;">
+
+    <!-- Settings panels -->
+    <div style="display:flex;flex-direction:column;gap:16px;">
+
+      <!-- ── WORKSPACE ────────────────────────────── -->
+      <div id="section-workspace" class="settings-section">
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:20px;">Workspace Settings</h2>
+          <div style="display:flex;flex-direction:column;gap:16px;">
             <div>
-              <div style="font-size: 13px; font-weight: 500;">Allow customer to request human</div>
-              <div style="font-size: 12px; color: #666;">Show "Talk to agent" button anytime</div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Workspace Name</label>
+              <input id="ws-name" class="input-field" placeholder="My Company" style="width:100%;max-width:400px;">
             </div>
-            <div onclick="this.classList.toggle('on')" style="width: 44px; height: 24px; background: #22c55e; border-radius: 100px; position: relative; cursor: pointer;">
-              <div style="position: absolute; right: 3px; top: 3px; width: 18px; height: 18px; background: #fff; border-radius: 50%; transition: all 0.2s;"></div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Timezone</label>
+              <select id="ws-timezone" class="input-field" style="max-width:400px;cursor:pointer;">
+                <option value="UTC-5">UTC-5 Eastern Time</option>
+                <option value="UTC-8">UTC-8 Pacific Time</option>
+                <option value="UTC+0">UTC+0 GMT</option>
+                <option value="UTC+1">UTC+1 CET</option>
+                <option value="UTC+5:30">UTC+5:30 IST</option>
+                <option value="UTC+8">UTC+8 CST/SGT</option>
+                <option value="UTC+9">UTC+9 JST</option>
+              </select>
             </div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Plan</label>
+              <div id="ws-plan" style="font-size:13px;padding:9px 12px;background:#1c1c1c;border:1px solid #262626;border-radius:8px;max-width:400px;color:#999;">Loading…</div>
+            </div>
+            <button onclick="saveWorkspace()" class="btn-primary" style="width:fit-content;" id="save-workspace-btn">Save Changes</button>
+            <div id="ws-save-msg" style="font-size:12px;color:#22c55e;display:none;">✓ Saved</div>
           </div>
-          
-          <button class="btn-primary" style="width: fit-content;">Save AI Settings</button>
         </div>
       </div>
-      
-      <!-- Widget embed code -->
-      <div class="card" style="padding: 24px;">
-        <h2 style="font-size: 16px; font-weight: 600; margin-bottom: 4px;">Widget Embed Code</h2>
-        <p style="font-size: 13px; color: #666; margin-bottom: 16px;">Add this script to your website to activate the chat widget</p>
-        <div style="background: #0d0d0d; border: 1px solid #1a1a1a; border-radius: 10px; padding: 16px; font-family: monospace; font-size: 12px; color: #999; position: relative; max-width: 600px;">
-          <code style="color: #6a4cf5;">&lt;script</code><br>
-          &nbsp;&nbsp;<code style="color: #22c55e;">src</code>=<code style="color: #ff7a3d;">"https://supportiq.io/widget.js"</code><br>
-          &nbsp;&nbsp;<code style="color: #22c55e;">data-key</code>=<code style="color: #ff7a3d;">"sk_live_acme_prod_••••••••"</code><br>
-          &nbsp;&nbsp;<code style="color: #22c55e;">data-color</code>=<code style="color: #ff7a3d;">"#6a4cf5"</code><br>
-          <code style="color: #6a4cf5;">&gt;&lt;/script&gt;</code>
-          <button onclick="copyEmbed()" style="position: absolute; top: 12px; right: 12px; background: #1c1c1c; border: 1px solid #262626; border-radius: 6px; padding: 6px 12px; color: #999; font-size: 11px; cursor: pointer;">
-            <i class="fas fa-copy"></i> Copy
-          </button>
+
+      <!-- ── AI SETTINGS ──────────────────────────── -->
+      <div id="section-ai" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">AI Configuration</h2>
+          <p style="font-size:13px;color:#666;margin-bottom:20px;">Configure how the AI assistant responds to customers</p>
+          <div style="display:flex;flex-direction:column;gap:16px;">
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Confidence Threshold for Escalation</label>
+              <div style="display:flex;align-items:center;gap:12px;">
+                <input type="range" min="0" max="100" value="50" style="flex:1;max-width:300px;accent-color:#6a4cf5;" id="ai-threshold"
+                  oninput="document.getElementById('ai-threshold-val').textContent = this.value + '%'">
+                <span style="font-size:14px;font-weight:600;min-width:40px;" id="ai-threshold-val">50%</span>
+              </div>
+              <div style="font-size:12px;color:#555;margin-top:4px;">AI escalates to human when confidence is below this threshold</div>
+            </div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Escalation Keywords</label>
+              <input id="ai-keywords" class="input-field" placeholder="refund, cancel, angry, lawsuit, urgent" style="width:100%;max-width:400px;">
+              <div style="font-size:12px;color:#555;margin-top:4px;">Comma-separated keywords that trigger immediate escalation</div>
+            </div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">AI Welcome Message</label>
+              <textarea id="ai-welcome" class="input-field" style="width:100%;max-width:500px;resize:vertical;min-height:80px;"
+                placeholder="Hi! I'm your AI support assistant. How can I help you?"></textarea>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;max-width:400px;padding:14px;background:#1c1c1c;border-radius:10px;">
+              <div>
+                <div style="font-size:13px;font-weight:500;">Allow customer to request human</div>
+                <div style="font-size:12px;color:#666;">Show "Talk to agent" button anytime</div>
+              </div>
+              <div id="ai-human-toggle" onclick="toggleHuman()" style="width:44px;height:24px;background:#22c55e;border-radius:100px;position:relative;cursor:pointer;">
+                <div style="position:absolute;right:3px;top:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:all 0.2s;" id="ai-human-dot"></div>
+              </div>
+            </div>
+            <button onclick="saveAI()" class="btn-primary" style="width:fit-content;">Save AI Settings</button>
+            <div id="ai-save-msg" style="font-size:12px;color:#22c55e;display:none;">✓ Saved</div>
+          </div>
         </div>
-        <div style="margin-top: 12px; display: flex; gap: 8px;">
-          <a href="/widget" class="btn-secondary" style="font-size: 12px; text-decoration: none;"><i class="fas fa-eye"></i> Preview Widget</a>
+      </div>
+
+      <!-- ── WIDGET DESIGN ────────────────────────── -->
+      <div id="section-widget" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">Widget Design & Embed</h2>
+          <p style="font-size:13px;color:#666;margin-bottom:20px;">Customize your chat widget appearance and get your embed code</p>
+          <div style="display:flex;flex-direction:column;gap:16px;">
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Primary Color</label>
+              <div style="display:flex;align-items:center;gap:10px;">
+                <input type="color" id="widget-color" value="#6a4cf5" style="width:44px;height:36px;border:none;background:none;cursor:pointer;border-radius:6px;"
+                  oninput="updateEmbedPreview()">
+                <input id="widget-color-hex" class="input-field" value="#6a4cf5" style="max-width:120px;"
+                  oninput="document.getElementById('widget-color').value=this.value; updateEmbedPreview()">
+              </div>
+            </div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Widget Position</label>
+              <select id="widget-position" class="input-field" style="max-width:200px;cursor:pointer;" oninput="updateEmbedPreview()">
+                <option value="bottom-right">Bottom Right</option>
+                <option value="bottom-left">Bottom Left</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Greeting Message</label>
+              <input id="widget-greeting" class="input-field" placeholder="Hi! How can I help you today?" style="width:100%;max-width:400px;"
+                oninput="updateEmbedPreview()">
+            </div>
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Input Placeholder</label>
+              <input id="widget-placeholder" class="input-field" placeholder="Ask me anything…" style="width:100%;max-width:400px;">
+            </div>
+            <button onclick="saveWidget()" class="btn-primary" style="width:fit-content;">Save Widget Settings</button>
+            <div id="widget-save-msg" style="font-size:12px;color:#22c55e;display:none;">✓ Saved</div>
+          </div>
         </div>
+
+        <!-- Embed code -->
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">Embed Code</h2>
+          <p style="font-size:13px;color:#666;margin-bottom:16px;">Add this script to your website's <code style="background:#1c1c1c;padding:2px 6px;border-radius:4px;font-size:12px;">&lt;head&gt;</code> or before <code style="background:#1c1c1c;padding:2px 6px;border-radius:4px;font-size:12px;">&lt;/body&gt;</code></p>
+          <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:10px;padding:16px;font-family:monospace;font-size:12px;color:#999;position:relative;max-width:620px;white-space:pre;overflow-x:auto;" id="embed-preview"></div>
+          <div style="margin-top:12px;display:flex;gap:8px;align-items:center;">
+            <button onclick="copyEmbed()" class="btn-secondary" style="font-size:12px;">
+              <i class="fas fa-copy"></i> Copy Embed Code
+            </button>
+            <a href="/widget" class="btn-secondary" style="font-size:12px;text-decoration:none;" target="_blank">
+              <i class="fas fa-eye"></i> Preview Widget
+            </a>
+            <span id="copy-msg" style="font-size:12px;color:#22c55e;display:none;">✓ Copied!</span>
+          </div>
+          <div style="margin-top:16px;padding:14px;background:#1c1c1c;border-radius:10px;max-width:620px;">
+            <div style="font-size:12px;font-weight:600;margin-bottom:8px;color:#fff;">API Key</div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+              <div id="api-key-display" style="font-family:monospace;font-size:12px;color:#999;background:#141414;padding:8px 12px;border-radius:6px;flex:1;min-width:200px;">No API key yet</div>
+              <button onclick="generateApiKey()" class="btn-secondary" style="font-size:12px;" id="gen-key-btn">
+                <i class="fas fa-key"></i> Generate New Key
+              </button>
+            </div>
+            <div id="new-key-reveal" style="display:none;margin-top:10px;padding:10px;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);border-radius:8px;">
+              <div style="font-size:11px;color:#22c55e;margin-bottom:6px;font-weight:600;">⚠ Save this key now — it won't be shown again!</div>
+              <div id="new-key-value" style="font-family:monospace;font-size:12px;color:#fff;word-break:break-all;"></div>
+              <button onclick="copyKey()" style="margin-top:8px;background:#22c55e22;border:1px solid #22c55e55;border-radius:6px;padding:4px 10px;font-size:11px;color:#22c55e;cursor:pointer;">Copy Key</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── NOTIFICATIONS ────────────────────────── -->
+      <div id="section-notifications" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">Notification Settings</h2>
+          <p style="font-size:13px;color:#666;margin-bottom:20px;">Configure email alerts for ticket events</p>
+          <div style="display:flex;flex-direction:column;gap:16px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;max-width:450px;padding:14px;background:#1c1c1c;border-radius:10px;">
+              <div>
+                <div style="font-size:13px;font-weight:500;">Email Notifications</div>
+                <div style="font-size:12px;color:#666;">Receive alerts for new escalations &amp; tickets</div>
+              </div>
+              <div id="notif-toggle" onclick="toggleNotif()" style="width:44px;height:24px;background:#333;border-radius:100px;position:relative;cursor:pointer;transition:background 0.2s;">
+                <div id="notif-dot" style="position:absolute;left:3px;top:3px;width:18px;height:18px;background:#fff;border-radius:50%;transition:all 0.2s;"></div>
+              </div>
+            </div>
+            <div id="notif-email-row">
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Notification Email</label>
+              <input id="notif-email" class="input-field" placeholder="alerts@company.com" type="email" style="max-width:400px;">
+            </div>
+            <button onclick="saveNotifications()" class="btn-primary" style="width:fit-content;">Save Notification Settings</button>
+            <div id="notif-save-msg" style="font-size:12px;color:#22c55e;display:none;">✓ Saved</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── TEAM ─────────────────────────────────── -->
+      <div id="section-team" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+            <h2 style="font-size:16px;font-weight:600;">Team & Roles</h2>
+            <button onclick="showInviteModal()" class="btn-primary" style="font-size:13px;">
+              <i class="fas fa-user-plus"></i> Invite Member
+            </button>
+          </div>
+          <div id="team-members-list">
+            <div style="color:#555;font-size:13px;">Loading team…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── BILLING ───────────────────────────────── -->
+      <div id="section-billing" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">Billing &amp; Plan</h2>
+          <p style="font-size:13px;color:#666;margin-bottom:20px;">Manage your subscription and payment method</p>
+          <div id="billing-info" style="display:flex;flex-direction:column;gap:16px;">
+            <div style="color:#555;font-size:13px;">Loading billing info…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── INTEGRATIONS ──────────────────────────── -->
+      <div id="section-integrations" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">Integrations</h2>
+          <p style="font-size:13px;color:#666;margin-bottom:20px;">Connect SupportIQ with your existing tools</p>
+          <div style="display:flex;flex-direction:column;gap:12px;">
+            ${[
+              { name: 'Slack', icon: 'fab fa-slack', desc: 'Post escalation alerts to a Slack channel', badge: 'Available', color: '#4a154b' },
+              { name: 'Zapier', icon: 'fas fa-bolt', desc: 'Automate workflows with 5,000+ apps', badge: 'Available', color: '#ff4a00' },
+              { name: 'Zendesk', icon: 'fas fa-headset', desc: 'Sync tickets bidirectionally with Zendesk', badge: 'Coming Soon', color: '#03363d' },
+              { name: 'Intercom', icon: 'fas fa-comments', desc: 'Import conversations from Intercom', badge: 'Coming Soon', color: '#1f8ded' },
+            ].map(i => `
+            <div style="display:flex;align-items:center;gap:16px;padding:16px;background:#1c1c1c;border-radius:12px;border:1px solid #262626;">
+              <div style="width:40px;height:40px;background:${i.color}33;border-radius:10px;display:flex;align-items:center;justify-content:center;">
+                <i class="${i.icon}" style="font-size:18px;color:${i.color === '#4a154b' ? '#a982cf' : i.color === '#ff4a00' ? '#ff7a3d' : '#6a4cf5'};"></i>
+              </div>
+              <div style="flex:1;">
+                <div style="font-size:13px;font-weight:600;">${i.name}</div>
+                <div style="font-size:12px;color:#666;">${i.desc}</div>
+              </div>
+              <span style="font-size:11px;padding:4px 10px;border-radius:100px;background:${i.badge === 'Available' ? 'rgba(34,197,94,0.15)' : '#1c1c1c'};color:${i.badge === 'Available' ? '#22c55e' : '#555'};border:1px solid ${i.badge === 'Available' ? 'rgba(34,197,94,0.3)' : '#2a2a2a'};">${i.badge}</span>
+              ${i.badge === 'Available' ? `<button onclick="connectIntegration('${i.name}')" class="btn-secondary" style="font-size:12px;">Connect</button>` : ''}
+            </div>`).join('')}
+          </div>
+        </div>
+
+        <!-- Slack webhook config -->
+        <div class="card" style="padding:24px;" id="slack-config" style="display:none;">
+          <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px;">
+            <i class="fab fa-slack" style="color:#a982cf;"></i> Slack Webhook Configuration
+          </h3>
+          <div style="display:flex;flex-direction:column;gap:12px;">
+            <div>
+              <label style="display:block;font-size:13px;color:#999;margin-bottom:6px;">Incoming Webhook URL</label>
+              <input id="slack-webhook-url" class="input-field" placeholder="https://hooks.slack.com/services/T.../B.../..." style="width:100%;max-width:500px;">
+              <div style="font-size:11px;color:#555;margin-top:4px;">Create one at <a href="https://api.slack.com/messaging/webhooks" target="_blank" style="color:#6a4cf5;">api.slack.com/messaging/webhooks</a></div>
+            </div>
+            <button onclick="saveSlackWebhook()" class="btn-primary" style="width:fit-content;">Save Slack Integration</button>
+            <div id="slack-save-msg" style="font-size:12px;color:#22c55e;display:none;">✓ Connected</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── API KEYS ──────────────────────────────── -->
+      <div id="section-apikeys" class="settings-section" style="display:none;">
+        <div class="card" style="padding:24px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;">
+            <div>
+              <h2 style="font-size:16px;font-weight:600;margin-bottom:4px;">API Keys</h2>
+              <p style="font-size:13px;color:#666;">Use these keys to authenticate the embeddable widget</p>
+            </div>
+            <button onclick="generateApiKey()" class="btn-primary" style="font-size:13px;"><i class="fas fa-plus"></i> Generate Key</button>
+          </div>
+          <div id="api-keys-list">
+            <div style="color:#555;font-size:13px;">Loading API keys…</div>
+          </div>
+          <div id="new-key-banner" style="display:none;margin-top:16px;padding:16px;background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);border-radius:10px;">
+            <div style="font-size:12px;color:#22c55e;font-weight:600;margin-bottom:8px;">⚠ New API Key — Save it now, it won't be shown again!</div>
+            <div id="new-key-text" style="font-family:monospace;font-size:13px;color:#fff;word-break:break-all;margin-bottom:8px;"></div>
+            <button onclick="copyNewKey()" class="btn-secondary" style="font-size:12px;">Copy Key</button>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- end panels -->
+  </div>
+
+  <!-- Invite Team Member Modal -->
+  <div id="invite-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center;">
+    <div class="card" style="padding:28px;width:420px;max-width:90vw;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+        <h3 style="font-size:15px;font-weight:600;">Invite Team Member</h3>
+        <button onclick="closeInviteModal()" style="background:none;border:none;color:#666;cursor:pointer;font-size:18px;">×</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <div>
+          <label style="font-size:12px;color:#999;display:block;margin-bottom:4px;">First Name</label>
+          <input id="invite-fname" class="input-field" placeholder="Jane" style="width:100%;">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#999;display:block;margin-bottom:4px;">Last Name</label>
+          <input id="invite-lname" class="input-field" placeholder="Smith" style="width:100%;">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#999;display:block;margin-bottom:4px;">Email</label>
+          <input id="invite-email" class="input-field" placeholder="jane@company.com" type="email" style="width:100%;">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#999;display:block;margin-bottom:4px;">Role</label>
+          <select id="invite-role" class="input-field" style="width:100%;cursor:pointer;">
+            <option value="agent">Agent</option>
+            <option value="admin">Admin</option>
+          </select>
+        </div>
+        <div id="invite-error" style="color:#ef4444;font-size:12px;display:none;"></div>
+        <button onclick="inviteMember()" class="btn-primary" style="width:100%;">Send Invitation</button>
+        <div id="invite-success" style="font-size:12px;color:#22c55e;display:none;text-align:center;"></div>
       </div>
     </div>
   </div>
-  
+
+  <style>
+    .settings-nav-item { color: #666; }
+    .settings-nav-item:hover, .settings-nav-item.active { background: #141414 !important; color: #fff !important; }
+    .settings-nav-item.active { background: #141414; color: #fff; }
+  </style>
+
   <script>
-    function copyEmbed() { 
-      navigator.clipboard.writeText('<script src="https://supportiq.io/widget.js" data-key="sk_live_acme_prod" data-color="#6a4cf5"><\/script>');
-      event.target.textContent = '✓ Copied!';
-      setTimeout(() => { event.target.innerHTML = '<i class="fas fa-copy"></i> Copy'; }, 2000);
+    // ── State ────────────────────────────────────────
+    let currentSettings = {};
+    let currentTenant = {};
+    let activeSection = 'workspace';
+    let allowHumanRequest = true;
+    let emailNotifEnabled = false;
+    let currentApiKey = '';
+    let newlyGeneratedKey = '';
+
+    // ── Navigation ───────────────────────────────────
+    function showSection(id) {
+      document.querySelectorAll('.settings-section').forEach(el => el.style.display = 'none');
+      document.querySelectorAll('.settings-nav-item').forEach(el => el.classList.remove('active'));
+      const sec = document.getElementById('section-' + id);
+      if (sec) sec.style.display = 'flex', sec.style.flexDirection = 'column', sec.style.gap = '16px';
+      const nav = document.getElementById('nav-' + id);
+      if (nav) nav.classList.add('active');
+      activeSection = id;
+      // Lazy-load section data
+      if (id === 'team') loadTeamMembers();
+      if (id === 'billing') loadBilling();
+      if (id === 'apikeys') loadApiKeys();
     }
+
+    // ── Load settings on mount ───────────────────────
+    async function loadSettings() {
+      try {
+        const res = await authFetch('/api/settings');
+        if (!res.ok) return;
+        const data = await res.json();
+        currentSettings = data.settings || {};
+        currentTenant = data.tenant || {};
+
+        // Workspace
+        document.getElementById('ws-name').value = currentTenant.name || '';
+        const tz = currentSettings.timezone || 'UTC+0';
+        const tzSel = document.getElementById('ws-timezone');
+        for (let opt of tzSel.options) { if (opt.value === tz) { opt.selected = true; break; } }
+        document.getElementById('ws-plan').textContent = (currentTenant.plan || 'free').charAt(0).toUpperCase() + (currentTenant.plan || 'free').slice(1) + ' Plan';
+
+        // AI
+        const thresh = Math.round((currentSettings.ai_confidence_threshold || 0.5) * 100);
+        document.getElementById('ai-threshold').value = thresh;
+        document.getElementById('ai-threshold-val').textContent = thresh + '%';
+        document.getElementById('ai-keywords').value = currentSettings.escalation_keywords || '';
+        document.getElementById('ai-welcome').value = currentSettings.ai_welcome_message || '';
+        allowHumanRequest = currentSettings.allow_human_request !== false;
+        updateHumanToggle();
+
+        // Widget
+        const color = currentSettings.widget_primary_color || '#6a4cf5';
+        document.getElementById('widget-color').value = color;
+        document.getElementById('widget-color-hex').value = color;
+        document.getElementById('widget-greeting').value = currentSettings.widget_greeting || '';
+        document.getElementById('widget-placeholder').value = currentSettings.widget_placeholder || '';
+        const pos = currentSettings.widget_position || 'bottom-right';
+        const posSel = document.getElementById('widget-position');
+        for (let opt of posSel.options) { if (opt.value === pos) { opt.selected = true; break; } }
+
+        // API key display
+        currentApiKey = currentSettings.api_key || '';
+        const keyDisplay = document.getElementById('api-key-display');
+        if (keyDisplay) keyDisplay.textContent = currentApiKey || 'No API key — generate one below';
+        updateEmbedPreview();
+
+        // Notifications
+        emailNotifEnabled = !!currentSettings.email_notifications;
+        updateNotifToggle();
+        document.getElementById('notif-email').value = currentSettings.notification_email || '';
+
+      } catch(e) { console.error('Settings load error', e); }
+    }
+
+    // ── Workspace save ───────────────────────────────
+    async function saveWorkspace() {
+      const btn = document.getElementById('save-workspace-btn');
+      btn.textContent = 'Saving…'; btn.disabled = true;
+      try {
+        const res = await authFetch('/api/settings', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            workspace_name: document.getElementById('ws-name').value,
+            timezone: document.getElementById('ws-timezone').value,
+          })
+        });
+        if (res.ok) {
+          const msg = document.getElementById('ws-save-msg');
+          msg.style.display = 'block';
+          setTimeout(() => msg.style.display = 'none', 2500);
+        }
+      } finally { btn.textContent = 'Save Changes'; btn.disabled = false; }
+    }
+
+    // ── AI save ──────────────────────────────────────
+    async function saveAI() {
+      const res = await authFetch('/api/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ai_confidence_threshold: parseInt(document.getElementById('ai-threshold').value) / 100,
+          escalation_keywords: document.getElementById('ai-keywords').value,
+          ai_welcome_message: document.getElementById('ai-welcome').value,
+          allow_human_request: allowHumanRequest,
+        })
+      });
+      if (res.ok) {
+        const msg = document.getElementById('ai-save-msg');
+        msg.style.display = 'block';
+        setTimeout(() => msg.style.display = 'none', 2500);
+      }
+    }
+
+    // ── Widget save ──────────────────────────────────
+    async function saveWidget() {
+      const res = await authFetch('/api/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          widget_primary_color: document.getElementById('widget-color-hex').value,
+          widget_position: document.getElementById('widget-position').value,
+          widget_greeting: document.getElementById('widget-greeting').value,
+          widget_placeholder: document.getElementById('widget-placeholder').value,
+        })
+      });
+      if (res.ok) {
+        const msg = document.getElementById('widget-save-msg');
+        msg.style.display = 'block';
+        setTimeout(() => msg.style.display = 'none', 2500);
+      }
+    }
+
+    // ── Notifications save ───────────────────────────
+    async function saveNotifications() {
+      const res = await authFetch('/api/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          email_notifications: emailNotifEnabled,
+          notification_email: document.getElementById('notif-email').value,
+        })
+      });
+      if (res.ok) {
+        const msg = document.getElementById('notif-save-msg');
+        msg.style.display = 'block';
+        setTimeout(() => msg.style.display = 'none', 2500);
+      }
+    }
+
+    // ── Toggles ──────────────────────────────────────
+    function toggleHuman() {
+      allowHumanRequest = !allowHumanRequest;
+      updateHumanToggle();
+    }
+    function updateHumanToggle() {
+      const t = document.getElementById('ai-human-toggle');
+      const d = document.getElementById('ai-human-dot');
+      if (!t || !d) return;
+      t.style.background = allowHumanRequest ? '#22c55e' : '#333';
+      d.style.left = allowHumanRequest ? 'auto' : '3px';
+      d.style.right = allowHumanRequest ? '3px' : 'auto';
+    }
+    function toggleNotif() {
+      emailNotifEnabled = !emailNotifEnabled;
+      updateNotifToggle();
+    }
+    function updateNotifToggle() {
+      const t = document.getElementById('notif-toggle');
+      const d = document.getElementById('notif-dot');
+      if (!t || !d) return;
+      t.style.background = emailNotifEnabled ? '#22c55e' : '#333';
+      d.style.left = emailNotifEnabled ? 'auto' : '3px';
+      d.style.right = emailNotifEnabled ? '3px' : 'auto';
+    }
+
+    // ── Embed preview ────────────────────────────────
+    function updateEmbedPreview() {
+      const color = document.getElementById('widget-color-hex')?.value || '#6a4cf5';
+      const key = currentApiKey || 'YOUR_API_KEY';
+      const origin = window.location.origin;
+      const code = \`<span style="color:#6a4cf5">&lt;script</span>
+  <span style="color:#22c55e">src</span>=<span style="color:#ff7a3d">"\${origin}/api/widget/widget.js"</span>
+  <span style="color:#22c55e">data-supportiq-key</span>=<span style="color:#ff7a3d">"\${key}"</span>
+  <span style="color:#22c55e">data-color</span>=<span style="color:#ff7a3d">"\${color}"</span>
+<span style="color:#6a4cf5">&gt;&lt;/script&gt;</span>\`;
+      const el = document.getElementById('embed-preview');
+      if (el) el.innerHTML = code;
+    }
+
+    function copyEmbed() {
+      const color = document.getElementById('widget-color-hex')?.value || '#6a4cf5';
+      const key = currentApiKey || 'YOUR_API_KEY';
+      const origin = window.location.origin;
+      const text = \`<script src="\${origin}/api/widget/widget.js" data-supportiq-key="\${key}" data-color="\${color}"><\\/script>\`;
+      navigator.clipboard.writeText(text).then(() => {
+        const msg = document.getElementById('copy-msg');
+        if (msg) { msg.style.display = 'inline'; setTimeout(() => msg.style.display = 'none', 2000); }
+      });
+    }
+
+    // ── API Key generation ───────────────────────────
+    async function generateApiKey() {
+      if (!confirm('Generate a new API key? Any existing key will continue working.')) return;
+      const btn = document.getElementById('gen-key-btn');
+      if (btn) { btn.textContent = 'Generating…'; btn.disabled = true; }
+      try {
+        const res = await authFetch('/api/settings/api-key', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok && data.key) {
+          newlyGeneratedKey = data.key;
+          currentApiKey = data.prefix;
+          const keyDisplay = document.getElementById('api-key-display');
+          if (keyDisplay) keyDisplay.textContent = data.prefix;
+          const reveal = document.getElementById('new-key-reveal');
+          if (reveal) {
+            reveal.style.display = 'block';
+            document.getElementById('new-key-value').textContent = data.key;
+          }
+          const banner = document.getElementById('new-key-banner');
+          if (banner) {
+            banner.style.display = 'block';
+            document.getElementById('new-key-text').textContent = data.key;
+          }
+          updateEmbedPreview();
+          loadApiKeys();
+        } else {
+          alert(data.error || 'Failed to generate key');
+        }
+      } finally {
+        if (btn) { btn.textContent = '⚡ Generate New Key'; btn.disabled = false; }
+      }
+    }
+
+    function copyKey() {
+      navigator.clipboard.writeText(newlyGeneratedKey);
+      event.target.textContent = '✓ Copied!';
+      setTimeout(() => event.target.textContent = 'Copy Key', 2000);
+    }
+    function copyNewKey() {
+      navigator.clipboard.writeText(newlyGeneratedKey);
+      event.target.textContent = '✓ Copied!';
+      setTimeout(() => event.target.textContent = 'Copy Key', 2000);
+    }
+
+    // ── Load team members ────────────────────────────
+    async function loadTeamMembers() {
+      const el = document.getElementById('team-members-list');
+      if (!el) return;
+      try {
+        const res = await authFetch('/api/settings/team');
+        const data = await res.json();
+        const team = data.team || [];
+        if (!team.length) { el.innerHTML = '<div style="color:#555;font-size:13px;">No team members yet.</div>'; return; }
+        const colors = ['#6a4cf5','#d44df0','#0099ff','#22c55e','#ff7a3d'];
+        el.innerHTML = team.map((u, i) => {
+          const initials = ((u.first_name||'')[0]||'') + ((u.last_name||'')[0]||'');
+          const color = colors[i % colors.length];
+          return \`<div style="display:flex;align-items:center;gap:14px;padding:12px 16px;background:#1c1c1c;border-radius:10px;margin-bottom:8px;">
+            <div style="width:38px;height:38px;background:\${color}22;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:\${color};">\${initials.toUpperCase()||'?'}</div>
+            <div style="flex:1;">
+              <div style="font-size:13px;font-weight:500;">\${u.first_name} \${u.last_name}</div>
+              <div style="font-size:11px;color:#666;">\${u.email}</div>
+            </div>
+            <span style="font-size:11px;background:#6a4cf522;color:#6a4cf5;padding:3px 10px;border-radius:100px;">\${u.role}</span>
+            <span style="font-size:11px;background:\${u.is_active ? 'rgba(34,197,94,0.15)' : '#1c1c1c'};color:\${u.is_active ? '#22c55e' : '#555'};padding:3px 10px;border-radius:100px;">\${u.is_active ? 'Active' : 'Inactive'}</span>
+          </div>\`;
+        }).join('');
+      } catch(e) { el.innerHTML = '<div style="color:#555;font-size:13px;">Failed to load team.</div>'; }
+    }
+
+    // ── Load billing ─────────────────────────────────
+    async function loadBilling() {
+      const el = document.getElementById('billing-info');
+      if (!el) return;
+      try {
+        const res = await authFetch('/api/billing/subscription');
+        const data = await res.json();
+        const sub = data.subscription || {};
+        const planColors = { free: '#666', pro: '#6a4cf5', enterprise: '#d44df0' };
+        const plan = sub.plan || 'free';
+        const color = planColors[plan] || '#666';
+        el.innerHTML = \`
+          <div style="display:flex;align-items:center;gap:16px;padding:16px;background:#1c1c1c;border-radius:12px;">
+            <div style="flex:1;">
+              <div style="font-size:12px;color:#666;margin-bottom:2px;">Current Plan</div>
+              <div style="font-size:22px;font-weight:700;color:\${color};">\${plan.charAt(0).toUpperCase()+plan.slice(1)}</div>
+            </div>
+            <div style="text-align:right;">
+              <div style="font-size:12px;color:#666;margin-bottom:2px;">Monthly Usage</div>
+              <div style="font-size:16px;font-weight:600;">\${sub.conversations_this_month||0} <span style="font-size:12px;color:#555;">/ \${sub.max_conversations||500} convs</span></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <button onclick="openCheckout('pro')" class="btn-primary" style="font-size:13px;">\${plan === 'pro' ? 'Current Plan' : 'Upgrade to Pro — $49/mo'}</button>
+            \${plan !== 'free' ? '<button onclick="openBillingPortal()" class="btn-secondary" style="font-size:13px;">Manage Billing</button>' : ''}
+          </div>
+        \`;
+      } catch(e) { el.innerHTML = '<div style="color:#555;font-size:13px;">Failed to load billing info.</div>'; }
+    }
+
+    async function openCheckout(plan) {
+      try {
+        const res = await authFetch('/api/billing/checkout', { method: 'POST', body: JSON.stringify({ plan }) });
+        const data = await res.json();
+        if (data.url) window.location.href = data.url;
+        else alert(data.error || data.message || 'Checkout unavailable');
+      } catch(e) { alert('Failed to open checkout'); }
+    }
+
+    async function openBillingPortal() {
+      try {
+        const res = await authFetch('/api/billing/portal', { method: 'POST' });
+        const data = await res.json();
+        if (data.url) window.open(data.url, '_blank');
+        else alert(data.error || data.message || 'Portal unavailable');
+      } catch(e) { alert('Failed to open billing portal'); }
+    }
+
+    // ── Load API keys list ───────────────────────────
+    async function loadApiKeys() {
+      const el = document.getElementById('api-keys-list');
+      if (!el) return;
+      // We show the prefix from settings for now (single key per tenant)
+      const key = currentApiKey || currentSettings?.api_key;
+      if (!key) {
+        el.innerHTML = '<div style="color:#555;font-size:13px;">No API keys yet. Generate one to get started.</div>';
+        return;
+      }
+      el.innerHTML = \`<div style="display:flex;align-items:center;gap:14px;padding:12px 16px;background:#1c1c1c;border-radius:10px;">
+        <i class="fas fa-key" style="color:#6a4cf5;font-size:16px;"></i>
+        <div style="flex:1;">
+          <div style="font-size:13px;font-weight:500;">Default API Key</div>
+          <div style="font-family:monospace;font-size:12px;color:#666;">\${key}••••••••••••</div>
+        </div>
+        <span style="font-size:11px;background:rgba(34,197,94,0.15);color:#22c55e;padding:3px 10px;border-radius:100px;">Active</span>
+      </div>\`;
+    }
+
+    // ── Invite modal ─────────────────────────────────
+    function showInviteModal() {
+      document.getElementById('invite-modal').style.display = 'flex';
+    }
+    function closeInviteModal() {
+      document.getElementById('invite-modal').style.display = 'none';
+      document.getElementById('invite-error').style.display = 'none';
+      document.getElementById('invite-success').style.display = 'none';
+    }
+    async function inviteMember() {
+      const body = {
+        first_name: document.getElementById('invite-fname').value,
+        last_name: document.getElementById('invite-lname').value,
+        email: document.getElementById('invite-email').value,
+        role: document.getElementById('invite-role').value,
+      };
+      if (!body.email || !body.first_name) {
+        document.getElementById('invite-error').textContent = 'First name and email are required';
+        document.getElementById('invite-error').style.display = 'block';
+        return;
+      }
+      try {
+        const res = await authFetch('/api/settings/team/invite', { method: 'POST', body: JSON.stringify(body) });
+        const data = await res.json();
+        if (res.ok) {
+          const msg = \`\${body.email} added successfully!\${data.temp_password ? ' Temp password: ' + data.temp_password : ''}\`;
+          document.getElementById('invite-success').textContent = msg;
+          document.getElementById('invite-success').style.display = 'block';
+          document.getElementById('invite-error').style.display = 'none';
+          loadTeamMembers();
+          setTimeout(closeInviteModal, 3000);
+        } else {
+          document.getElementById('invite-error').textContent = data.error || 'Invite failed';
+          document.getElementById('invite-error').style.display = 'block';
+        }
+      } catch(e) { document.getElementById('invite-error').textContent = 'Network error'; document.getElementById('invite-error').style.display = 'block'; }
+    }
+
+    // ── Integrations ─────────────────────────────────
+    function connectIntegration(name) {
+      if (name === 'Slack') {
+        document.getElementById('slack-config').style.display = 'block';
+        document.getElementById('slack-config').scrollIntoView({ behavior: 'smooth' });
+      } else {
+        alert(name + ' integration coming soon!');
+      }
+    }
+    async function saveSlackWebhook() {
+      const url = document.getElementById('slack-webhook-url').value.trim();
+      if (!url.startsWith('https://hooks.slack.com/')) {
+        alert('Please enter a valid Slack Incoming Webhook URL');
+        return;
+      }
+      const res = await authFetch('/api/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({ slack_webhook_url: url })
+      });
+      if (res.ok) {
+        const msg = document.getElementById('slack-save-msg');
+        msg.style.display = 'block';
+        setTimeout(() => msg.style.display = 'none', 2500);
+      }
+    }
+
+    // ── Init ─────────────────────────────────────────
+    showSection('workspace');
+    loadSettings();
   </script>`
 }
 
@@ -2072,253 +2970,126 @@ function getWidgetDemoHTML(): string {
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #f5f5f5; font-family: 'Inter', sans-serif; min-height: 100vh; }
-    .demo-site { max-width: 900px; margin: 0 auto; padding: 40px 24px; }
-    .demo-header { background: #1a1a2e; color: white; padding: 16px 24px; display: flex; gap: 16px; align-items: center; border-radius: 12px; margin-bottom: 24px; }
-    .demo-card { background: white; border-radius: 12px; padding: 32px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-    
-    /* Chat Widget */
-    #chat-widget { position: fixed; bottom: 24px; right: 24px; z-index: 1000; font-family: 'Inter', sans-serif; }
-    #chat-button { width: 52px; height: 52px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 20px rgba(106,76,245,0.5); transition: transform 0.2s; }
-    #chat-button:hover { transform: scale(1.08); }
-    #chat-panel { display: none; position: fixed; bottom: 90px; right: 24px; width: 360px; max-height: 580px; background: #141414; border: 1px solid #262626; border-radius: 20px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.5); flex-direction: column; }
-    #chat-panel.open { display: flex; }
-    
-    .chat-header { padding: 16px 18px; border-bottom: 1px solid #1a1a1a; display: flex; align-items: center; gap: 10px; background: #141414; }
-    .chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; background: #090909; }
-    .chat-input-area { padding: 12px 16px; border-top: 1px solid #1a1a1a; background: #141414; }
-    
-    .msg-ai { background: rgba(106,76,245,0.15); border-radius: 12px 12px 12px 4px; padding: 10px 14px; max-width: 85%; }
-    .msg-user { background: #1c1c1c; border-radius: 12px 12px 4px 12px; padding: 10px 14px; max-width: 85%; align-self: flex-end; }
-    
-    @keyframes typing { 0%,80%,100%{transform:scale(0.8);opacity:0.5} 40%{transform:scale(1);opacity:1} }
-    .dot { width: 5px; height: 5px; background: #666; border-radius: 50%; display: inline-block; animation: typing 1.4s infinite; }
-    .dot:nth-child(2){animation-delay:.2s}
-    .dot:nth-child(3){animation-delay:.4s}
-    
-    ::-webkit-scrollbar { width: 3px; }
-    ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
-    
-    .source-pill { font-size: 10px; color: #6a4cf5; background: rgba(106,76,245,0.15); padding: 2px 8px; border-radius: 100px; border: 1px solid rgba(106,76,245,0.25); cursor: pointer; display: inline-block; margin-top: 6px; }
-    
-    .suggested-btn { background: #1c1c1c; border: 1px solid #262626; border-radius: 8px; padding: 7px 12px; font-size: 12px; color: #ccc; cursor: pointer; text-align: left; transition: all 0.15s; font-family: inherit; }
-    .suggested-btn:hover { background: #262626; color: #fff; }
-    
-    #unread-badge { position: absolute; top: -4px; right: -4px; background: #d44df0; color: #fff; border-radius: 50%; width: 18px; height: 18px; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; border: 2px solid #f5f5f5; }
+    body { background: #f0f0f5; font-family: 'Inter', sans-serif; min-height: 100vh; }
+    .demo-site { max-width: 900px; margin: 0 auto; padding: 32px 24px; }
+    .demo-header { background: linear-gradient(135deg, #1a1a2e, #16213e); color: white; padding: 20px 28px; display: flex; gap: 16px; align-items: center; border-radius: 14px; margin-bottom: 20px; box-shadow: 0 4px 24px rgba(0,0,0,0.15); }
+    .demo-card { background: white; border-radius: 14px; padding: 32px; margin-bottom: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); }
+    .faq-item { border-bottom: 1px solid #f0f0f0; padding: 14px 0; cursor: pointer; }
+    .faq-item:last-child { border-bottom: none; }
+    .faq-q { font-size: 14px; font-weight: 500; color: #222; display: flex; justify-content: space-between; align-items: center; }
+    .faq-q:after { content: '+'; color: #6a4cf5; font-size: 18px; }
   </style>
 </head>
 <body>
 
 <!-- Demo website content -->
 <div class="demo-site">
-  <div style="background: #141414; color: #999; padding: 8px 16px; border-radius: 8px; font-size: 12px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
-    <i class="fas fa-info-circle" style="color: #6a4cf5;"></i>
-    This is a demo page showing the SupportIQ chat widget embedded on a customer website. Click the purple button in the bottom-right corner!
-    <a href="/dashboard" style="margin-left: auto; color: #6a4cf5; text-decoration: none;">← Dashboard</a>
+
+  <!-- Info banner -->
+  <div style="background: #1a1a2e; color: #aaa; padding: 10px 18px; border-radius: 10px; font-size: 12px; margin-bottom: 18px; display: flex; align-items: center; gap: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">
+    <i class="fas fa-circle-info" style="color: #6a4cf5; font-size: 14px;"></i>
+    <span>This page demonstrates the <strong style="color:#fff;">SupportIQ</strong> chat widget embedded on a customer website. The widget loads from <code style="background:#262626;padding:2px 6px;border-radius:4px;color:#d44df0;">/api/widget/widget.js</code> — click the button in the bottom-right! 
+    </span>
+    <a href="/dashboard" style="margin-left: auto; color: #6a4cf5; text-decoration: none; white-space: nowrap; font-weight: 500;">← Dashboard</a>
   </div>
 
+  <!-- Mock company header -->
   <div class="demo-header">
-    <i class="fas fa-store" style="font-size: 20px;"></i>
-    <div>
-      <div style="font-size: 16px; font-weight: 600;">Acme Corp — Help Center</div>
-      <div style="font-size: 13px; opacity: 0.6;">Product documentation and support</div>
+    <div style="width: 44px; height: 44px; background: rgba(106,76,245,0.3); border-radius: 12px; display: flex; align-items: center; justify-content: center;">
+      <i class="fas fa-store" style="font-size: 20px; color: #a982cf;"></i>
+    </div>
+    <div style="flex: 1;">
+      <div style="font-size: 18px; font-weight: 700;">Acme Corp — Help Center</div>
+      <div style="font-size: 13px; opacity: 0.55; margin-top: 2px;">Documentation, tutorials and support</div>
+    </div>
+    <div style="display: flex; gap: 20px; font-size: 13px; opacity: 0.6;">
+      <span>Docs</span><span>API</span><span>Community</span>
     </div>
   </div>
-  
+
+  <!-- Getting started -->
   <div class="demo-card">
-    <h1 style="font-size: 22px; font-weight: 600; color: #1a1a2e; margin-bottom: 8px;">Getting Started Guide</h1>
-    <p style="color: #666; line-height: 1.6; margin-bottom: 20px;">Welcome to Acme Corp! This guide will help you set up your account and get started with our platform quickly.</p>
+    <h1 style="font-size: 22px; font-weight: 700; color: #111; margin-bottom: 8px;">Getting Started with Acme Corp</h1>
+    <p style="color: #666; line-height: 1.7; margin-bottom: 24px; font-size: 14px;">Welcome! This guide covers everything you need to set up your account and start building with the Acme platform in minutes.</p>
     <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;">
-      ${['Account Setup', 'API Integration', 'Billing & Plans', 'Troubleshooting'].map(t => `
-      <div style="border: 1px solid #e5e5e5; border-radius: 10px; padding: 16px;">
-        <div style="font-size: 14px; font-weight: 600; color: #1a1a2e; margin-bottom: 4px;">${t}</div>
-        <div style="font-size: 13px; color: #888;">Learn how to ${t.toLowerCase()}</div>
+      ${['📦 Account Setup', '🔌 API Integration', '💳 Billing & Plans', '🛠 Troubleshooting'].map(t => `
+      <div style="border: 1.5px solid #eee; border-radius: 12px; padding: 18px; cursor: pointer; transition: border-color 0.15s;" onmouseover="this.style.borderColor='#6a4cf5'" onmouseout="this.style.borderColor='#eee'">
+        <div style="font-size: 15px; font-weight: 600; color: #111; margin-bottom: 5px;">${t}</div>
+        <div style="font-size: 13px; color: #888; line-height: 1.5;">Step-by-step walkthrough →</div>
       </div>`).join('')}
     </div>
   </div>
-  
+
+  <!-- FAQ -->
   <div class="demo-card">
-    <h2 style="font-size: 16px; font-weight: 600; color: #1a1a2e; margin-bottom: 12px;">Frequently Asked Questions</h2>
-    ${['How do I reset my password?', 'What payment methods do you accept?', 'How does API rate limiting work?'].map(q => `
-    <div style="border-bottom: 1px solid #f0f0f0; padding: 12px 0;">
-      <div style="font-size: 14px; font-weight: 500; color: #333;">${q}</div>
+    <h2 style="font-size: 17px; font-weight: 700; color: #111; margin-bottom: 16px;">Frequently Asked Questions</h2>
+    ${[
+      'How do I reset my password?',
+      'What payment methods do you accept?',
+      'How does API rate limiting work?',
+      'Can I export my data?',
+      'How do I add team members?'
+    ].map(q => `
+    <div class="faq-item">
+      <div class="faq-q">${q}</div>
     </div>`).join('')}
   </div>
+
+  <!-- CTA -->
+  <div class="demo-card" style="background: linear-gradient(135deg, #6a4cf520, #d44df015); border: 1px solid #6a4cf530; text-align: center;">
+    <div style="font-size: 20px; font-weight: 700; color: #111; margin-bottom: 8px;">Can't find what you're looking for?</div>
+    <p style="color: #666; font-size: 14px; margin-bottom: 16px;">Our AI support assistant can answer most questions instantly. Just click the chat button in the bottom-right corner!</p>
+    <div style="font-size: 12px; color: #888;">Powered by <span style="color: #6a4cf5; font-weight: 600;">SupportIQ AI</span> · Average response time &lt; 5 seconds</div>
+  </div>
+
 </div>
 
-<!-- Chat Widget -->
-<div id="chat-widget">
-  <div style="position: relative;">
-    <button id="chat-button" onclick="toggleChat()">
-      <i class="fas fa-comment-dots" id="chat-icon" style="color: white; font-size: 20px;"></i>
-      <i class="fas fa-times" id="close-icon" style="color: white; font-size: 18px; display: none;"></i>
-    </button>
-    <div id="unread-badge">1</div>
-  </div>
-</div>
+<!--
+  ╔══════════════════════════════════════════════════════════╗
+  ║  REAL WIDGET EMBED — loaded from /api/widget/widget.js  ║
+  ║  The script tag below is all you need on your website.  ║
+  ╚══════════════════════════════════════════════════════════╝
 
-<div id="chat-panel">
-  <!-- Header -->
-  <div class="chat-header">
-    <div style="width: 34px; height: 34px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-      <i class="fas fa-bolt" style="color: white; font-size: 13px;"></i>
-    </div>
-    <div style="flex: 1;">
-      <div style="font-size: 13px; font-weight: 600; color: #fff;">Acme Support AI</div>
-      <div style="font-size: 11px; color: #22c55e; display: flex; align-items: center; gap: 4px;"><span style="width: 5px; height: 5px; background: #22c55e; border-radius: 50; display: inline-block;"></span> Online — replies instantly</div>
-    </div>
-    <button onclick="toggleChat()" style="background: none; border: none; color: #666; cursor: pointer; font-size: 14px;"><i class="fas fa-times"></i></button>
-  </div>
-  
-  <!-- Messages -->
-  <div class="chat-messages" id="messages-container">
-    <!-- Welcome message -->
-    <div style="display: flex; gap: 8px; align-items: flex-start;">
-      <div style="width: 24px; height: 24px; background: linear-gradient(135deg, #6a4cf5, #d44df0); border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 2px;">
-        <i class="fas fa-bolt" style="color: white; font-size: 9px;"></i>
-      </div>
-      <div>
-        <div class="msg-ai">
-          <div style="font-size: 11px; color: #6a4cf5; margin-bottom: 4px; font-weight: 600;">AI Assistant</div>
-          <div style="font-size: 12px; color: #ccc; line-height: 1.6;">👋 Hi there! I'm the AI support assistant for Acme Corp. I can answer questions about our products, billing, and technical setup. How can I help you today?</div>
-        </div>
-        <div style="font-size: 10px; color: #555; margin-top: 4px;">just now</div>
-      </div>
-    </div>
-    
-    <!-- Suggested questions -->
-    <div style="display: flex; flex-direction: column; gap: 6px;">
-      <div style="font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 0.5px;">Suggested</div>
-      <button class="suggested-btn" onclick="sendSuggestedMsg('How do I reset my password?')">🔑 How do I reset my password?</button>
-      <button class="suggested-btn" onclick="sendSuggestedMsg('What are your pricing plans?')">💳 What are your pricing plans?</button>
-      <button class="suggested-btn" onclick="sendSuggestedMsg('How do I connect to the API?')">🔌 How do I connect to the API?</button>
-    </div>
-  </div>
-  
-  <!-- Input -->
-  <div class="chat-input-area">
-    <div style="display: flex; gap: 8px; align-items: center;">
-      <input id="chat-input" type="text" placeholder="Ask me anything..." 
-        style="flex: 1; background: #1c1c1c; border: 1px solid #262626; border-radius: 8px; padding: 9px 12px; color: #fff; font-size: 13px; outline: none; font-family: inherit;"
-        onfocus="this.style.borderColor='rgba(0,153,255,0.4)'" 
-        onblur="this.style.borderColor='#262626'"
-        onkeypress="if(event.key==='Enter') sendMsg()">
-      <button onclick="sendMsg()" style="background: linear-gradient(135deg, #6a4cf5, #d44df0); border: none; border-radius: 8px; width: 34px; height: 34px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-        <i class="fas fa-paper-plane" style="color: white; font-size: 11px;"></i>
-      </button>
-    </div>
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 8px;">
-      <div style="font-size: 10px; color: #444;">Powered by <span style="color: #6a4cf5;">SupportIQ</span></div>
-      <button id="human-btn" onclick="requestHuman()" style="background: none; border: none; font-size: 10px; color: #555; cursor: pointer; font-family: inherit;">Talk to agent →</button>
-    </div>
-  </div>
-</div>
-
-<script>
-  let isOpen = false;
-  let msgCount = 0;
-  
-  function toggleChat() {
-    isOpen = !isOpen;
-    document.getElementById('chat-panel').classList.toggle('open', isOpen);
-    document.getElementById('chat-icon').style.display = isOpen ? 'none' : 'block';
-    document.getElementById('close-icon').style.display = isOpen ? 'block' : 'none';
-    if (isOpen) document.getElementById('unread-badge').style.display = 'none';
-  }
-  
-  function addMsg(content, type, sources, showEscalate) {
-    const container = document.getElementById('messages-container');
-    const wrapper = document.createElement('div');
-    wrapper.style.cssText = 'display:flex;gap:8px;align-items:flex-start;' + (type === 'user' ? 'flex-direction:row-reverse;' : '');
-    
-    const avatar = document.createElement('div');
-    if (type === 'ai') {
-      avatar.style.cssText = 'width:24px;height:24px;background:linear-gradient(135deg,#6a4cf5,#d44df0);border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px;';
-      avatar.innerHTML = '<i class="fas fa-bolt" style="color:white;font-size:9px;"></i>';
-    } else {
-      avatar.style.cssText = 'width:24px;height:24px;background:#333;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:2px;font-size:10px;font-weight:700;color:#fff;';
-      avatar.textContent = 'You';
-    }
-    
-    const bubble = document.createElement('div');
-    bubble.className = type === 'ai' ? 'msg-ai' : 'msg-user';
-    
-    let html = '';
-    if (type === 'ai') html += '<div style="font-size:11px;color:#6a4cf5;margin-bottom:4px;font-weight:600;">AI Assistant</div>';
-    html += '<div style="font-size:12px;color:#ccc;line-height:1.6;">' + content + '</div>';
-    
-    if (sources && sources.length) {
-      sources.forEach(s => { html += '<span class="source-pill">📄 ' + s + '</span> '; });
-    }
-    
-    if (showEscalate) {
-      html += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.1);">';
-      html += '<button onclick="requestHuman()" style="background:rgba(106,76,245,0.2);border:1px solid rgba(106,76,245,0.4);border-radius:8px;padding:7px 14px;font-size:12px;color:#6a4cf5;cursor:pointer;font-family:inherit;width:100%;text-align:center;">Connect me to a human agent →</button>';
-      html += '</div>';
-    }
-    
-    bubble.innerHTML = html;
-    wrapper.appendChild(avatar);
-    wrapper.appendChild(bubble);
-    container.appendChild(wrapper);
-    container.scrollTop = container.scrollHeight;
-  }
-  
-  function addTyping() {
-    const container = document.getElementById('messages-container');
-    const wrapper = document.createElement('div');
-    wrapper.id = 'typing-indicator';
-    wrapper.style.cssText = 'display:flex;gap:8px;align-items:center;';
-    wrapper.innerHTML = '<div style="width:24px;height:24px;background:linear-gradient(135deg,#6a4cf5,#d44df0);border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;"><i class="fas fa-bolt" style="color:white;font-size:9px;"></i></div><div style="background:rgba(106,76,245,0.1);border-radius:12px;padding:10px 14px;display:flex;gap:4px;"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>';
-    container.appendChild(wrapper);
-    container.scrollTop = container.scrollHeight;
-  }
-  
-  function removeTyping() { document.getElementById('typing-indicator')?.remove(); }
-  
-  async function sendMsg() {
-    const input = document.getElementById('chat-input');
-    const msg = input.value.trim();
-    if (!msg) return;
-    input.value = '';
-    
-    addMsg(msg, 'user');
-    addTyping();
-    
+  NOTE: data-supportiq-key must be a real API key generated
+  in Settings → Widget Design → API Key.
+  For this demo page we load config dynamically from the server.
+-->
+<script id="supportiq-demo-loader">
+  // In the real embed, the user puts their API key directly:
+  // <script src="..." data-supportiq-key="sk_live_YOUR_KEY" ...><\/script>
+  //
+  // For the demo page we fetch the workspace key from the API
+  // so it works without hardcoding anything.
+  (async function() {
     try {
-      const res = await fetch('/api/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({message: msg}) });
-      const data = await res.json();
-      removeTyping();
-      addMsg(data.content, 'ai', data.sources, data.escalate || data.confidence < 0.5);
+      const token = localStorage.getItem('siq_token');
+      if (!token) {
+        // No session — load widget with a placeholder key so the UI still shows
+        loadWidget('DEMO_KEY');
+        return;
+      }
+      const res = await fetch('/api/settings', { headers: { Authorization: 'Bearer ' + token } });
+      if (res.ok) {
+        const data = await res.json();
+        const key = (data.settings && data.settings.api_key) || 'DEMO_KEY';
+        loadWidget(key);
+      } else {
+        loadWidget('DEMO_KEY');
+      }
     } catch(e) {
-      removeTyping();
-      addMsg('Sorry, I encountered an error. Please try again or contact our team.', 'ai', [], true);
+      loadWidget('DEMO_KEY');
     }
+  })();
+
+  function loadWidget(apiKey) {
+    const script = document.createElement('script');
+    script.src = '/api/widget/widget.js';
+    script.setAttribute('data-supportiq-key', apiKey);
+    script.setAttribute('data-color', '#6a4cf5');
+    document.body.appendChild(script);
   }
-  
-  function sendSuggestedMsg(msg) {
-    document.getElementById('chat-input').value = msg;
-    // Remove suggestion buttons
-    document.querySelectorAll('.suggested-btn').forEach(b => b.closest('div')?.remove());
-    sendMsg();
-  }
-  
-  function requestHuman() {
-    addMsg('Connecting you to a human agent now...', 'ai');
-    setTimeout(() => {
-      addMsg('You are now in a queue. Our next available agent will be with you shortly. Estimated wait: 2 minutes. 🕐', 'ai');
-    }, 1000);
-    document.getElementById('human-btn').textContent = '⏳ In queue...';
-    document.getElementById('human-btn').disabled = true;
-  }
-  
-  // Auto-open after 3s
-  setTimeout(() => {
-    if (!isOpen) {
-      toggleChat();
-    }
-  }, 3000);
 </script>
+
 </body>
 </html>`
 }

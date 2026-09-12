@@ -8,6 +8,7 @@ export interface Tenant {
   name: string
   subdomain: string
   plan: 'free' | 'pro' | 'enterprise'
+  stripe_customer_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -93,7 +94,9 @@ export interface Ticket {
   assigned_agent_id: string | null
   customer_name: string
   customer_email: string
+  channel?: string
   sla_deadline: string | null
+  sla_due_at?: string | null
   resolved_at: string | null
   created_at: string
   updated_at: string
@@ -106,8 +109,14 @@ export interface WorkspaceSettings {
   ai_welcome_message: string
   allow_human_request: number
   widget_color: string
+  widget_primary_color?: string
+  widget_greeting?: string
+  widget_placeholder?: string
+  widget_position?: string
   api_key: string | null
   timezone: string
+  email_notifications?: number
+  notification_email?: string
   updated_at: string
 }
 
@@ -420,7 +429,7 @@ export class DB {
 
   async getStats(tenant_id: string): Promise<{
     tickets: { total: number; open: number; in_progress: number; resolved: number }
-    conversations: { total: number; ai_handling: number; escalated: number }
+    conversations: { total: number; open: number; ai_handling: number; escalated: number }
     ai_resolution_rate: number
   }> {
     const ticketStats = await this.d1.prepare(`
@@ -435,19 +444,20 @@ export class DB {
     const convStats = await this.d1.prepare(`
       SELECT
         COUNT(*) AS total,
+        SUM(CASE WHEN status IN ('open','ai_handling','escalated') THEN 1 ELSE 0 END) AS open,
         SUM(CASE WHEN status = 'ai_handling' THEN 1 ELSE 0 END) AS ai_handling,
         SUM(CASE WHEN status = 'escalated' THEN 1 ELSE 0 END) AS escalated,
         SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved
       FROM conversations WHERE tenant_id = ?
-    `).bind(tenant_id).first<{ total: number; ai_handling: number; escalated: number; resolved: number }>()
+    `).bind(tenant_id).first<{ total: number; open: number; ai_handling: number; escalated: number; resolved: number }>()
 
     const t = ticketStats || { total: 0, open: 0, in_progress: 0, resolved: 0 }
-    const c = convStats || { total: 0, ai_handling: 0, escalated: 0, resolved: 0 }
+    const c = convStats || { total: 0, open: 0, ai_handling: 0, escalated: 0, resolved: 0 }
     const aiRate = c.total > 0 ? Math.round(((c.resolved - c.escalated) / c.total) * 100 * 10) / 10 : 0
 
     return {
       tickets: { total: t.total, open: t.open, in_progress: t.in_progress, resolved: t.resolved },
-      conversations: { total: c.total, ai_handling: c.ai_handling, escalated: c.escalated },
+      conversations: { total: c.total, open: c.open, ai_handling: c.ai_handling, escalated: c.escalated },
       ai_resolution_rate: Math.max(0, aiRate)
     }
   }
