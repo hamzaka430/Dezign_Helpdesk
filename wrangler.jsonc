@@ -28,7 +28,6 @@
   "vars": {
     "ENVIRONMENT": "production",
     "APP_URL": "https://supportiq.pages.dev",
-    // Set to "true" to enable subdomain-based tenant routing (e.g. acme.supportiq.pages.dev)
     "TENANT_SUBDOMAIN_ENABLED": "false"
   }
 
