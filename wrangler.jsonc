@@ -27,7 +27,6 @@
   // ---- Environment Variables (non-secret) -----------------
   "vars": {
     "ENVIRONMENT": "production",
-    "APP_URL": "https://supportiq.pages.dev",
     "TENANT_SUBDOMAIN_ENABLED": "false"
   }
 
