@@ -65,6 +65,69 @@ auth.post('/signup', async (c) => {
       first_name, last_name, role: 'admin'
     })
 
+    // ── Seed demo data for new tenant ───────────────────────
+    try {
+      const now = new Date().toISOString()
+      const ticketIds = [generateId('ticket'), generateId('ticket'), generateId('ticket')]
+
+      // Sample tickets
+      const sampleTickets = [
+        {
+          id: ticketIds[0], tenant_id: tenantId,
+          subject: 'Cannot reset my password — email not arriving',
+          description: 'I requested a password reset 30 minutes ago but no email arrived. Checked spam folder too.',
+          status: 'open', priority: 'high',
+          customer_name: 'Sarah Johnson', customer_email: 'sarah.j@example.com',
+          channel: 'email', created_at: now, updated_at: now
+        },
+        {
+          id: ticketIds[1], tenant_id: tenantId,
+          subject: 'How do I export my data to CSV?',
+          description: 'I need to export all my records to CSV for quarterly reporting. Cannot find the option.',
+          status: 'resolved', priority: 'medium',
+          customer_name: 'Marcus Lee', customer_email: 'marcus.lee@techcorp.io',
+          channel: 'widget', created_at: now, updated_at: now
+        },
+        {
+          id: ticketIds[2], tenant_id: tenantId,
+          subject: 'Billing charge question — unexpected amount',
+          description: 'My last invoice shows $149 but I am on the $99 plan. Please clarify.',
+          status: 'in_progress', priority: 'urgent',
+          customer_name: 'Priya Sharma', customer_email: 'priya@startup.co',
+          channel: 'email', created_at: now, updated_at: now
+        }
+      ]
+
+      for (const ticket of sampleTickets) {
+        await c.env.DB.prepare(
+          `INSERT INTO tickets (id, tenant_id, subject, description, status, priority, customer_name, customer_email, channel, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          ticket.id, ticket.tenant_id, ticket.subject, ticket.description,
+          ticket.status, ticket.priority, ticket.customer_name, ticket.customer_email,
+          ticket.channel, ticket.created_at, ticket.updated_at
+        ).run()
+      }
+
+      // Sample conversation
+      const convId = generateId('conv')
+      await c.env.DB.prepare(
+        `INSERT INTO conversations (id, tenant_id, customer_name, customer_email, channel, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(convId, tenantId, 'Demo Customer', 'demo@example.com', 'widget', 'resolved', now, now).run()
+
+      // Sample knowledge base article
+      const kbId = generateId('kb')
+      await c.env.DB.prepare(
+        `INSERT INTO knowledge_bases (id, tenant_id, name, description, article_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).bind(kbId, tenantId, 'Getting Started Guide', 'Core documentation for new customers', 3, now, now).run()
+
+    } catch (seedErr) {
+      // Seed failure is non-fatal — user still gets their account
+      console.warn('[signup seed]', seedErr)
+    }
+
     // Sign JWT
     const token = await signToken({
       sub: userId, tenant_id: tenantId,
